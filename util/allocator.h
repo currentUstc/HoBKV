@@ -13,45 +13,44 @@
 #pragma once
 #include <cerrno>
 #include <cstddef>
-//#include "rocksdb/write_buffer_manager.h"
+// #include "rocksdb/write_buffer_manager.h"
 
 namespace TimberSaw {
 
 class Logger;
 
 class Allocator {
- public:
-  virtual ~Allocator() {}
+public:
+    virtual ~Allocator() {}
 
-  virtual char* Allocate(size_t bytes) = 0;
-  virtual char* AllocateAligned(size_t bytes, size_t huge_page_size = 0,
-                                Logger* logger = nullptr) = 0;
+    virtual char* Allocate(size_t bytes) = 0;
+    virtual char* AllocateAligned(size_t bytes, size_t huge_page_size = 0, Logger* logger = nullptr) = 0;
 
-  virtual size_t BlockSize() const = 0;
+    virtual size_t BlockSize() const = 0;
 };
 // The AllocatorTracker below is a ugly coded dummy function.
 class AllocTracker {
- public:
-  AllocTracker();
-  // No copying allowed
-  AllocTracker(const AllocTracker&) = delete;
-  void operator=(const AllocTracker&) = delete;
+public:
+    AllocTracker();
+    // No copying allowed
+    AllocTracker(const AllocTracker&) = delete;
+    void operator=(const AllocTracker&) = delete;
 
-  ~AllocTracker();
-  void Allocate(size_t bytes);
-  // Call when we're finished allocating memory so we can free it from
-  // the write buffer's limit.
-  void DoneAllocating();
+    ~AllocTracker();
+    void Allocate(size_t bytes);
+    // Call when we're finished allocating memory so we can free it from
+    // the write buffer's limit.
+    void DoneAllocating();
 
-  void FreeMem();
+    void FreeMem();
 
-  bool is_freed() const { return false; }
+    bool is_freed() const { return false; }
 
- private:
-//  WriteBufferManager* write_buffer_manager_;
-  std::atomic<size_t> bytes_allocated_;
-  bool done_allocating_;
-  bool freed_;
+private:
+    //  WriteBufferManager* write_buffer_manager_;
+    std::atomic<size_t> bytes_allocated_;
+    bool done_allocating_;
+    bool freed_;
 };
 
-}  // namespace ROCKSDB_NAMESPACE
+}  // namespace TimberSaw

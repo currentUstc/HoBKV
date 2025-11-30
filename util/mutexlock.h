@@ -26,70 +26,64 @@ namespace TimberSaw {
 //   }
 
 class MutexLock {
- public:
-  explicit MutexLock(port::Mutex *mu) : mu_(mu) {
-    this->mu_->Lock();
-  }
-  // No copying allowed
-  MutexLock(const MutexLock &) = delete;
-  void operator=(const MutexLock &) = delete;
+public:
+    explicit MutexLock(port::Mutex* mu) : mu_(mu) { this->mu_->Lock(); }
+    // No copying allowed
+    MutexLock(const MutexLock&) = delete;
+    void operator=(const MutexLock&) = delete;
 
-  ~MutexLock() { this->mu_->Unlock(); }
+    ~MutexLock() { this->mu_->Unlock(); }
 
- private:
-  port::Mutex *const mu_;
+private:
+    port::Mutex* const mu_;
 };
 //
 // SpinMutex has very low overhead for low-contention cases.  Method names
 // are chosen so you can use std::unique_lock or std::lock_guard with it.
 //
 class SpinMutex {
- public:
-  SpinMutex() : locked_(false) {}
-  //TODO this spinmutex have problem, some time 2 thread can walk into the protected code.
-  bool try_lock() {
-    auto currently_locked = locked_.load(std::memory_order_relaxed);
-    return !currently_locked &&
-           locked_.compare_exchange_weak(currently_locked, true,
-                                         std::memory_order_acquire,
-                                         std::memory_order_relaxed);
-  }
-
-  void lock() {
-    for (size_t tries = 0;; ++tries) {
-      if (try_lock()) {
-        // success
-        break;
-      }
-      port::AsmVolatilePause();
-      if (tries > 100) {
-        //        printf("I tried so many time I got yield\n");
-        std::this_thread::yield();
-      }
+public:
+    SpinMutex() : locked_(false) {}
+    // TODO this spinmutex have problem, some time 2 thread can walk into the protected code.
+    bool try_lock() {
+        auto currently_locked = locked_.load(std::memory_order_relaxed);
+        return !currently_locked && locked_.compare_exchange_weak(currently_locked, true, std::memory_order_acquire,
+                                                                  std::memory_order_relaxed);
     }
-  }
 
-  void unlock() {
-    locked_.store(false, std::memory_order_release);
-    //    printf("spin mutex unlocked. \n");
-  }
+    void lock() {
+        for (size_t tries = 0;; ++tries) {
+            if (try_lock()) {
+                // success
+                break;
+            }
+            port::AsmVolatilePause();
+            if (tries > 100) {
+                //        printf("I tried so many time I got yield\n");
+                std::this_thread::yield();
+            }
+        }
+    }
 
-  // private:
-  std::atomic<bool> locked_;
+    void unlock() {
+        locked_.store(false, std::memory_order_release);
+        //    printf("spin mutex unlocked. \n");
+    }
+
+    // private:
+    std::atomic<bool> locked_;
 };
 class SpinLock {
- public:
-  explicit SpinLock(SpinMutex *mu) : mu_(mu) {
-    this->mu_->lock();
-  }
-  // No copying allowed
-  SpinLock(const SpinLock &) = delete;
-  void operator=(const SpinLock &) = delete;
+public:
+    explicit SpinLock(SpinMutex* mu) : mu_(mu) { this->mu_->lock(); }
+    // No copying allowed
+    SpinLock(const SpinLock&) = delete;
+    void operator=(const SpinLock&) = delete;
 
-  ~SpinLock() { this->mu_->unlock(); }
+    ~SpinLock() { this->mu_->unlock(); }
 
- private:
-  SpinMutex *const mu_;
+private:
+    SpinMutex* const mu_;
 };
 
 //
@@ -98,34 +92,32 @@ class SpinLock {
 // object goes out of scope.
 //
 class ReadLock {
- public:
-  explicit ReadLock(port::RWMutex *mu) : mu_(mu) {
-    this->mu_->ReadLock();
-  }
-  // No copying allowed
-  ReadLock(const ReadLock &) = delete;
-  void operator=(const ReadLock &) = delete;
+public:
+    explicit ReadLock(port::RWMutex* mu) : mu_(mu) { this->mu_->ReadLock(); }
+    // No copying allowed
+    ReadLock(const ReadLock&) = delete;
+    void operator=(const ReadLock&) = delete;
 
-  ~ReadLock() { this->mu_->ReadUnlock(); }
+    ~ReadLock() { this->mu_->ReadUnlock(); }
 
- private:
-  port::RWMutex *const mu_;
+private:
+    port::RWMutex* const mu_;
 };
 
 //
 // Automatically unlock a locked mutex when the object is destroyed
 //
 class ReadUnlock {
- public:
-  explicit ReadUnlock(port::RWMutex *mu) : mu_(mu) { mu->AssertHeld(); }
-  // No copying allowed
-  ReadUnlock(const ReadUnlock &) = delete;
-  ReadUnlock &operator=(const ReadUnlock &) = delete;
+public:
+    explicit ReadUnlock(port::RWMutex* mu) : mu_(mu) { mu->AssertHeld(); }
+    // No copying allowed
+    ReadUnlock(const ReadUnlock&) = delete;
+    ReadUnlock& operator=(const ReadUnlock&) = delete;
 
-  ~ReadUnlock() { mu_->ReadUnlock(); }
+    ~ReadUnlock() { mu_->ReadUnlock(); }
 
- private:
-  port::RWMutex *const mu_;
+private:
+    port::RWMutex* const mu_;
 };
 
 //
@@ -134,29 +126,25 @@ class ReadUnlock {
 // object goes out of scope.
 //
 class WriteLock {
- public:
-  explicit WriteLock(port::RWMutex *mu) : mu_(mu) {
-    this->mu_->WriteLock();
-  }
-  // No copying allowed
-  WriteLock(const WriteLock &) = delete;
-  void operator=(const WriteLock &) = delete;
+public:
+    explicit WriteLock(port::RWMutex* mu) : mu_(mu) { this->mu_->WriteLock(); }
+    // No copying allowed
+    WriteLock(const WriteLock&) = delete;
+    void operator=(const WriteLock&) = delete;
 
-  ~WriteLock() { this->mu_->WriteUnlock(); }
+    ~WriteLock() { this->mu_->WriteUnlock(); }
 
- private:
-  port::RWMutex *const mu_;
+private:
+    port::RWMutex* const mu_;
 };
 
-
-//TODO: implement a spin read wirte lock to control some short synchronization more
-// efficiently.
-
+// TODO: implement a spin read wirte lock to control some short synchronization more
+//  efficiently.
 
 // We want to prevent false sharing
 template <class T>
 struct ALIGN_AS(CACHE_LINE_SIZE) LockData {
-  T lock_;
+    T lock_;
 };
 
 //
@@ -170,38 +158,34 @@ struct ALIGN_AS(CACHE_LINE_SIZE) LockData {
 //
 template <class T, class P>
 class Striped {
- public:
-  Striped(size_t stripes, std::function<uint64_t(const P &)> hash)
-      : stripes_(stripes), hash_(hash) {
-
-    locks_ = reinterpret_cast<LockData<T> *>(
-        port::cacheline_aligned_alloc(sizeof(LockData<T>) * stripes));
-    for (size_t i = 0; i < stripes; i++) {
-      new (&locks_[i]) LockData<T>();
+public:
+    Striped(size_t stripes, std::function<uint64_t(const P&)> hash) : stripes_(stripes), hash_(hash) {
+        locks_ = reinterpret_cast<LockData<T>*>(port::cacheline_aligned_alloc(sizeof(LockData<T>) * stripes));
+        for (size_t i = 0; i < stripes; i++) {
+            new (&locks_[i]) LockData<T>();
+        }
     }
 
-  }
-
-  virtual ~Striped() {
-    if (locks_ != nullptr) {
-      assert(stripes_ > 0);
-      for (size_t i = 0; i < stripes_; i++) {
-        locks_[i].~LockData<T>();
-      }
-      port::cacheline_aligned_free(locks_);
+    virtual ~Striped() {
+        if (locks_ != nullptr) {
+            assert(stripes_ > 0);
+            for (size_t i = 0; i < stripes_; i++) {
+                locks_[i].~LockData<T>();
+            }
+            port::cacheline_aligned_free(locks_);
+        }
     }
-  }
 
-  T *get(const P &key) {
-    uint64_t h = hash_(key);
-    size_t index = h % stripes_;
-    return &reinterpret_cast<LockData<T> *>(&locks_[index])->lock_;
-  }
+    T* get(const P& key) {
+        uint64_t h = hash_(key);
+        size_t index = h % stripes_;
+        return &reinterpret_cast<LockData<T>*>(&locks_[index])->lock_;
+    }
 
- private:
-  size_t stripes_;
-  LockData<T> *locks_;
-  std::function<uint64_t(const P &)> hash_;
+private:
+    size_t stripes_;
+    LockData<T>* locks_;
+    std::function<uint64_t(const P&)> hash_;
 };
 
 }  // namespace TimberSaw

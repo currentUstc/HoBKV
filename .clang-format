@@ -16,3 +16,8 @@ IncludeCategories:
     Priority:        3
   - Regex:           '.*'
     Priority:        4
+
+IndentWidth: 4
+ColumnLimit: 120
+AccessModifierOffset: -4
+AllowShortFunctionsOnASingleLine: Inline

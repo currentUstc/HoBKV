@@ -15,6 +15,7 @@
 #include <string>
 
 #include "TimberSaw/slice.h"
+
 #include "port/port.h"
 
 namespace TimberSaw {
@@ -37,11 +38,11 @@ void PutLengthPrefixedSlice(std::string* dst, const Slice& value);
 bool GetVarint32(Slice* input, uint32_t* value);
 bool GetVarint64(Slice* input, uint64_t* value);
 bool GetLengthPrefixedSlice(Slice* input, Slice* result);
-//Slice GetLengthPrefixedSlice(const char* data);
-// Pointer-based variants of GetVarint...  These either store a value
-// in *v and return a pointer just past the parsed value, or return
-// nullptr on error.  These routines only look at bytes in the range
-// [p..limit-1]
+// Slice GetLengthPrefixedSlice(const char* data);
+//  Pointer-based variants of GetVarint...  These either store a value
+//  in *v and return a pointer just past the parsed value, or return
+//  nullptr on error.  These routines only look at bytes in the range
+//  [p..limit-1]
 const char* GetVarint32Ptr(const char* p, const char* limit, uint32_t* v);
 const char* GetVarint64Ptr(const char* p, const char* limit, uint64_t* v);
 
@@ -58,74 +59,72 @@ char* EncodeVarint64(char* buf, uint64_t value);
 // REQUIRES: dst has enough space for the value being written
 
 inline void EncodeFixed32(char* buf, uint32_t value) {
-  if (port::kLittleEndian) {
-    memcpy(buf, &value, sizeof(value));
-  } else {
-    buf[0] = value & 0xff;
-    buf[1] = (value >> 8) & 0xff;
-    buf[2] = (value >> 16) & 0xff;
-    buf[3] = (value >> 24) & 0xff;
-  }
+    if (port::kLittleEndian) {
+        memcpy(buf, &value, sizeof(value));
+    } else {
+        buf[0] = value & 0xff;
+        buf[1] = (value >> 8) & 0xff;
+        buf[2] = (value >> 16) & 0xff;
+        buf[3] = (value >> 24) & 0xff;
+    }
 }
 
 inline void EncodeFixed64(char* buf, uint64_t value) {
-  if (port::kLittleEndian) {
-    memcpy(buf, &value, sizeof(value));
-  } else {
-    buf[0] = value & 0xff;
-    buf[1] = (value >> 8) & 0xff;
-    buf[2] = (value >> 16) & 0xff;
-    buf[3] = (value >> 24) & 0xff;
-    buf[4] = (value >> 32) & 0xff;
-    buf[5] = (value >> 40) & 0xff;
-    buf[6] = (value >> 48) & 0xff;
-    buf[7] = (value >> 56) & 0xff;
-  }
+    if (port::kLittleEndian) {
+        memcpy(buf, &value, sizeof(value));
+    } else {
+        buf[0] = value & 0xff;
+        buf[1] = (value >> 8) & 0xff;
+        buf[2] = (value >> 16) & 0xff;
+        buf[3] = (value >> 24) & 0xff;
+        buf[4] = (value >> 32) & 0xff;
+        buf[5] = (value >> 40) & 0xff;
+        buf[6] = (value >> 48) & 0xff;
+        buf[7] = (value >> 56) & 0xff;
+    }
 }
 
 // Lower-level versions of Get... that read directly from a character buffer
 // without any bounds checking.
 
 inline uint32_t DecodeFixed32(const char* ptr) {
-  if (port::kLittleEndian) {
-    // Load the raw bytes
-    uint32_t result;
-    memcpy(&result, ptr, sizeof(result));  // gcc optimizes this to a plain load
-    return result;
-  } else {
-    return ((static_cast<uint32_t>(static_cast<unsigned char>(ptr[0])))
-    | (static_cast<uint32_t>(static_cast<unsigned char>(ptr[1])) << 8)
-    | (static_cast<uint32_t>(static_cast<unsigned char>(ptr[2])) << 16)
-    | (static_cast<uint32_t>(static_cast<unsigned char>(ptr[3])) << 24));
-  }
+    if (port::kLittleEndian) {
+        // Load the raw bytes
+        uint32_t result;
+        memcpy(&result, ptr, sizeof(result));  // gcc optimizes this to a plain load
+        return result;
+    } else {
+        return ((static_cast<uint32_t>(static_cast<unsigned char>(ptr[0]))) |
+                (static_cast<uint32_t>(static_cast<unsigned char>(ptr[1])) << 8) |
+                (static_cast<uint32_t>(static_cast<unsigned char>(ptr[2])) << 16) |
+                (static_cast<uint32_t>(static_cast<unsigned char>(ptr[3])) << 24));
+    }
 }
 
 inline uint64_t DecodeFixed64(const char* ptr) {
-  if (port::kLittleEndian) {
-    // Load the raw bytes
-    uint64_t result;
-    memcpy(&result, ptr, sizeof(result));  // gcc optimizes this to a plain load
-    return result;
-  } else {
-    uint64_t lo = DecodeFixed32(ptr);
-    uint64_t hi = DecodeFixed32(ptr + 4);
-    return (hi << 32) | lo;
-  }
+    if (port::kLittleEndian) {
+        // Load the raw bytes
+        uint64_t result;
+        memcpy(&result, ptr, sizeof(result));  // gcc optimizes this to a plain load
+        return result;
+    } else {
+        uint64_t lo = DecodeFixed32(ptr);
+        uint64_t hi = DecodeFixed32(ptr + 4);
+        return (hi << 32) | lo;
+    }
 }
 
 // Internal routine for use by fallback path of GetVarint32Ptr
-const char* GetVarint32PtrFallback(const char* p, const char* limit,
-                                   uint32_t* value);
-inline const char* GetVarint32Ptr(const char* p, const char* limit,
-                                  uint32_t* value) {
-  if (p < limit) {
-    uint32_t result = *(reinterpret_cast<const uint8_t*>(p));
-    if ((result & 128) == 0) {
-      *value = result;
-      return p + 1;
+const char* GetVarint32PtrFallback(const char* p, const char* limit, uint32_t* value);
+inline const char* GetVarint32Ptr(const char* p, const char* limit, uint32_t* value) {
+    if (p < limit) {
+        uint32_t result = *(reinterpret_cast<const uint8_t*>(p));
+        if ((result & 128) == 0) {
+            *value = result;
+            return p + 1;
+        }
     }
-  }
-  return GetVarint32PtrFallback(p, limit, value);
+    return GetVarint32PtrFallback(p, limit, value);
 }
 
 }  // namespace TimberSaw

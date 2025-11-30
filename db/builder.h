@@ -31,8 +31,7 @@ class VersionEdit;
 // *meta will be filled with metadata about the generated table.
 // If no data is present in *iter, meta->file_size will be set to
 // zero, and no Table file will be produced.
-Status BuildTable(const std::string& dbname, Env* env, const Options& options,
-                  TableCache* table_cache, Iterator* iter,
+Status BuildTable(const std::string& dbname, Env* env, const Options& options, TableCache* table_cache, Iterator* iter,
                   std::shared_ptr<RemoteMemTableMetaData> meta, IO_type type);
 
 }  // namespace TimberSaw

@@ -5,28 +5,31 @@
 #ifndef STORAGE_TimberSaw_UTIL_TESTUTIL_H_
 #define STORAGE_TimberSaw_UTIL_TESTUTIL_H_
 
-#include "gmock/gmock.h"
-#include "gtest/gtest.h"
 #include "helpers/memenv/memenv.h"
+
 #include "TimberSaw/env.h"
 #include "TimberSaw/slice.h"
+
 #include "util/random.h"
+
+#include "gmock/gmock.h"
+#include "gtest/gtest.h"
 
 namespace TimberSaw {
 namespace test {
 
-MATCHER(IsOK, "") { return arg.ok(); }
+MATCHER(IsOK, "") {
+    return arg.ok();
+}
 
 // Macros for testing the results of functions that return TimberSaw::Status or
 // absl::StatusOr<T> (for any type T).
-#define EXPECT_TimberSaw_OK(expression) \
-  EXPECT_THAT(expression, TimberSaw::test::IsOK())
-#define ASSERT_TimberSaw_OK(expression) \
-  ASSERT_THAT(expression, TimberSaw::test::IsOK())
+#define EXPECT_TimberSaw_OK(expression) EXPECT_THAT(expression, TimberSaw::test::IsOK())
+#define ASSERT_TimberSaw_OK(expression) ASSERT_THAT(expression, TimberSaw::test::IsOK())
 
 // Returns the random seed used at the start of the current test run.
 inline int RandomSeed() {
-  return testing::UnitTest::GetInstance()->random_seed();
+    return testing::UnitTest::GetInstance()->random_seed();
 }
 
 // Store in *dst a random string of length "len" and return a Slice that
@@ -40,40 +43,34 @@ std::string RandomKey(Random* rnd, int len);
 // Store in *dst a string of length "len" that will compress to
 // "N*compressed_fraction" bytes and return a Slice that references
 // the generated data.
-Slice CompressibleString(Random* rnd, double compressed_fraction, size_t len,
-                         std::string* dst);
+Slice CompressibleString(Random* rnd, double compressed_fraction, size_t len, std::string* dst);
 
 // A wrapper that allows injection of errors.
 class ErrorEnv : public EnvWrapper {
- public:
-  bool writable_file_error_;
-  int num_writable_file_errors_;
+public:
+    bool writable_file_error_;
+    int num_writable_file_errors_;
 
-  ErrorEnv()
-      : EnvWrapper(NewMemEnv(Env::Default())),
-        writable_file_error_(false),
-        num_writable_file_errors_(0) {}
-  ~ErrorEnv() override { delete target(); }
+    ErrorEnv() : EnvWrapper(NewMemEnv(Env::Default())), writable_file_error_(false), num_writable_file_errors_(0) {}
+    ~ErrorEnv() override { delete target(); }
 
-  Status NewWritableFile(const std::string& fname,
-                         WritableFile** result) override {
-    if (writable_file_error_) {
-      ++num_writable_file_errors_;
-      *result = nullptr;
-      return Status::IOError(fname, "fake error");
+    Status NewWritableFile(const std::string& fname, WritableFile** result) override {
+        if (writable_file_error_) {
+            ++num_writable_file_errors_;
+            *result = nullptr;
+            return Status::IOError(fname, "fake error");
+        }
+        return target()->NewWritableFile(fname, result);
     }
-    return target()->NewWritableFile(fname, result);
-  }
 
-  Status NewAppendableFile(const std::string& fname,
-                           WritableFile** result) override {
-    if (writable_file_error_) {
-      ++num_writable_file_errors_;
-      *result = nullptr;
-      return Status::IOError(fname, "fake error");
+    Status NewAppendableFile(const std::string& fname, WritableFile** result) override {
+        if (writable_file_error_) {
+            ++num_writable_file_errors_;
+            *result = nullptr;
+            return Status::IOError(fname, "fake error");
+        }
+        return target()->NewAppendableFile(fname, result);
     }
-    return target()->NewAppendableFile(fname, result);
-  }
 };
 
 }  // namespace test

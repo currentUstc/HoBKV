@@ -6,8 +6,8 @@
 #define TIMBERSAW_RPC_PROCESS_H
 
 class RPC_Process {
- public:
-  virtual void persistence_unpin_handler(void* arg) = 0;
+public:
+    virtual void persistence_unpin_handler(void* arg) = 0;
 };
 
 #endif  // TIMBERSAW_RPC_PROCESS_H

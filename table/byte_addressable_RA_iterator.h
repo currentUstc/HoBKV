@@ -5,23 +5,25 @@
 #ifndef TIMBERSAW_BYTE_ADDRESSABLE_RA_ITERATOR_H
 #define TIMBERSAW_BYTE_ADDRESSABLE_RA_ITERATOR_H
 
-#include "TimberSaw/iterator.h"
-#include "iterator_wrapper.h"
-#include "TimberSaw/options.h"
-#include "two_level_iterator.h"
 #include "db/version_set.h"
+
+#include "TimberSaw/iterator.h"
+#include "TimberSaw/options.h"
 #include "TimberSaw/table.h"
+
 #include "table/block.h"
 #include "table/format.h"
 #include "table/iterator_wrapper.h"
-//#include "two_level_iterator.h"
+
+#include "iterator_wrapper.h"
+#include "two_level_iterator.h"
+// #include "two_level_iterator.h"
 namespace TimberSaw {
 typedef Slice (*KVFunction)(void*, const ReadOptions&, const Slice&);
 
-class ByteAddressableRAIterator :public Iterator{
-   public:
-    ByteAddressableRAIterator(Iterator* index_iter, KVFunction block_function,
-                              void* arg, const ReadOptions& options,
+class ByteAddressableRAIterator : public Iterator {
+public:
+    ByteAddressableRAIterator(Iterator* index_iter, KVFunction block_function, void* arg, const ReadOptions& options,
                               bool compute_side);
 
     ~ByteAddressableRAIterator() override;
@@ -34,23 +36,21 @@ class ByteAddressableRAIterator :public Iterator{
 
     bool Valid() const override { return valid_; }
     Slice key() const override {
-      assert(Valid());
-      return key_.GetKey();
+        assert(Valid());
+        return key_.GetKey();
     }
     Slice value() const override {
-      assert(Valid());
-      return value_;
+        assert(Valid());
+        return value_;
     }
-    Status status() const override {
-        return status_;
-    }
+    Status status() const override { return status_; }
 
-   private:
+private:
     void SaveError(const Status& s) {
-      if (status_.ok() && !s.ok()) status_ = s;
+        if (status_.ok() && !s.ok()) status_ = s;
     }
-//    void SkipEmptyDataBlocksForward();
-//    void SkipEmptyDataBlocksBackward();
+    //    void SkipEmptyDataBlocksForward();
+    //    void SkipEmptyDataBlocksBackward();
     void GetKV();
     bool compute_side_;
     char* mr_addr;
@@ -67,11 +67,10 @@ class ByteAddressableRAIterator :public Iterator{
 #ifndef NDEBUG
     BlockHandle index_handle;
     std::string last_key;
-    int64_t num_entries=0;
+    int64_t num_entries = 0;
 #endif
     bool valid_;
 };
-}
-
+}  // namespace TimberSaw
 
 #endif  // TIMBERSAW_BYTE_ADDRESSABLE_RA_ITERATOR_H

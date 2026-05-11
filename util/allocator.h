@@ -11,6 +11,7 @@
 // when the allocator object is destroyed. See the Arena class for more info.
 
 #pragma once
+#include <atomic>
 #include <cerrno>
 #include <cstddef>
 // #include "rocksdb/write_buffer_manager.h"

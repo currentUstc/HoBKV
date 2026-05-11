@@ -28,6 +28,17 @@ class Snapshot;
 #define INDEX_BLOCK_SMALL (384 * 1024ULL)
 #define FILTER_BLOCK (256 * 1024ULL)
 #define FILTER_BLOCK_COMPRESSION (3 * 1024 * 1024ULL)
+
+// bucket table parameters
+#define BUCKET_SIZE (512 * 1024 * 1024ULL)
+#define BUCKET_NUMBER (16ULL)
+#define SLOT_SIZE (4ULL)  // 4 bytes for offset
+#define SLOT_NUM_PER_BUCKET (BUCKET_SIZE / SLOT_SIZE)
+
+// value zone parameters
+#define VALUE_ZONE_MAX_SIZE (16 * 1024 * 1024 * 1024ULL)  // 16GB
+#define VALUE_ZONE_ALLOC_SIZE (1 * 1024 * 1024 * 1024ULL)  // 1GB
+
 // static size_t RDMA_WRITE_BLOCK = 1*1024*1024;
 //  DB contents are stored in a set of blocks, each of which holds a
 //  sequence of key,value pairs.  Each block may be compressed before

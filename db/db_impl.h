@@ -12,7 +12,10 @@
 #include <condition_variable>
 #include <deque>
 #include <set>
+#include <unordered_map>
+#include <unordered_set>
 #include <string>
+#include <vector>
 
 #include "TimberSaw/db.h"
 #include "TimberSaw/env.h"
@@ -25,6 +28,9 @@
 #include "memtable_list.h"
 #include "version_set.h"
 
+#include "bucket/bucket_table_handler.h"
+#include "bucket/value_zone.h"
+
 namespace TimberSaw {
 
 class MemTable;
@@ -33,6 +39,7 @@ class Version;
 class VersionEdit;
 class VersionSet;
 class MemTableList;
+class RDMA_Manager;
 // TODO: make memtableversionlist and LSM versionset 's function integrated into
 //  Superversion.
 struct SuperVersion {
@@ -83,7 +90,7 @@ class DBImpl : public DB, RPC_Process {
 class DBImpl : public DB {
 #endif
 public:
-    DBImpl(const Options& options, const std::string& dbname);
+    DBImpl(const Options& options, const std::string& dbname, const unsigned long long max_key_range);
     DBImpl(const Options& raw_options, const std::string& dbname, const std::string ub, const std::string lb);
     DBImpl(const DBImpl&) = delete;
     DBImpl& operator=(const DBImpl&) = delete;
@@ -146,6 +153,10 @@ public:
     std::string lower_bound;
     // long double server_cpu_percent = 0.0;
     //  void Wait_for_client_message_hanlding_setup();
+    bool IsHotKey(const Slice& user_key);
+    std::shared_ptr<ValueZone> GetValueZone() const { return value_zone_; }
+    std::shared_ptr<RDMA_Manager> GetRDMA_Manager() const { return env_ ? env_->rdma_mg : nullptr; }
+    uint8_t GetShardTargetNodeId() const { return shard_target_node_id; }
 private:
     friend class DB;
     //  struct CompactionState;
@@ -229,6 +240,26 @@ private:
     void sync_option_to_remote(uint8_t target_node_id);
     void remote_qp_reset(std::string& qp_type, uint8_t target_node_id);
     void install_version_edit_handler(RDMA_Request* request, std::string client_ip);
+    void bucket_meta_update_handler(RDMA_Request* request);
+    bool ShouldReadSSTForKey(const Slice& user_key, size_t shard_idx, SequenceNumber* cutover_sequence);
+    bool TryGetValueFromBucket(size_t shard_idx, const Slice& user_key, std::string* value, SequenceNumber* seq,
+                               Status* status);
+
+    
+    void RecordKeyAccess(const Slice& key, bool is_write);
+    
+    // 热度评分和冷热区域调整
+    void UpdateHotnessScore();
+    void AdjustHotColdRegions();
+    void MaybeScheduleHotnessAdjustment();
+    static void BGWork_HotnessAdjustment(void* db);
+    void BackgroundHotnessAdjustment();
+
+    void Hot2Cold(size_t shard_idx);
+    void Cold2Hot(size_t shard_idx);
+    Status EnsureBucketAllocatedForShard(size_t shard_idx);
+    void GetShardKeyRange(size_t shard_idx, uint64_t* min_key, uint64_t* max_key) const;
+
 #ifdef WITHPERSISTENCE
     static void SSTable_Unpin_Dispatch(void* thread_args);
     void persistence_unpin_handler(void* arg);
@@ -325,6 +356,94 @@ private:
     //  std::map<uint16_t,uint16_t> compute_core_number_map;
     // TODO(chuqing): add for count time, need a better calculator
     long int accumulated_time = 0;
+
+    struct ShardConfig {
+        size_t max_bucket_tables = 16;  // Maximum number of bucket tables allowed per shard
+        size_t KV_shards = 32;
+    };
+
+    const ShardConfig shard_config_ = ShardConfig();
+
+    unsigned long long max_key_range_ = 0;
+    
+    std::mutex hot_stats_mutex_;                           // 保护热度统计和 LRU 列表
+    std::list<size_t> hot_region_lru_;                     // LRU 列表，存储热区域的 shard 索引
+    std::unordered_set<size_t> hot_region_set_;            // 热区域集合，便于快速查找
+    std::atomic<bool> hotness_adjustment_scheduled_{false}; // 是否已调度热度调整任务
+    uint64_t last_hotness_check_time_ = 0;                 // 上次热度检查时间（微秒）
+    
+    struct HotnessConfig {
+        uint64_t check_interval_us = 10000000;  // 检查间隔：10秒
+        uint64_t hot_threshold = 1000;           // 热度阈值：访问次数
+        double decay_factor = 0.9;               // 衰减因子
+        double read_weight = 1.0;                // 读访问权重
+        double write_weight = 2.0;               // 写访问权重
+    } hotness_config_;
+
+    struct KeyRangeHotStats {
+        const unsigned long long min_key;
+        const unsigned long long max_key;
+        std::atomic<uint64_t> access_count{0};
+        std::atomic<uint64_t> read_count{0};
+        std::atomic<uint64_t> write_count{0};
+        // uint64_t last_access_time;
+        double hotness_score;
+        uint64_t last_interval_access;
+        uint64_t last_interval_reads;
+        uint64_t last_interval_writes;
+        bool ishot;
+        
+        KeyRangeHotStats(unsigned long long min, unsigned long long max)
+            : min_key(min), 
+              max_key(max),
+              last_interval_access(0),
+              last_interval_reads(0),
+              last_interval_writes(0),
+              ishot(false),
+              // last_access_time(0),
+              hotness_score(0.0) {}
+
+        KeyRangeHotStats(const KeyRangeHotStats& other)
+            : min_key(other.min_key),
+              max_key(other.max_key),
+              access_count(other.access_count.load(std::memory_order_relaxed)),
+              read_count(other.read_count.load(std::memory_order_relaxed)),
+              write_count(other.write_count.load(std::memory_order_relaxed)),
+              hotness_score(other.hotness_score),
+              last_interval_access(other.last_interval_access),
+              last_interval_reads(other.last_interval_reads),
+              last_interval_writes(other.last_interval_writes),
+              ishot(other.ishot) {}
+
+        KeyRangeHotStats(KeyRangeHotStats&& other) noexcept
+            : min_key(other.min_key),
+              max_key(other.max_key),
+              access_count(other.access_count.load(std::memory_order_relaxed)),
+              read_count(other.read_count.load(std::memory_order_relaxed)),
+              write_count(other.write_count.load(std::memory_order_relaxed)),
+              hotness_score(other.hotness_score),
+              last_interval_access(other.last_interval_access),
+              last_interval_reads(other.last_interval_reads),
+              last_interval_writes(other.last_interval_writes),
+              ishot(other.ishot) {}
+
+        KeyRangeHotStats& operator=(const KeyRangeHotStats&) = delete;
+        KeyRangeHotStats& operator=(KeyRangeHotStats&&) = delete;
+    };
+
+    std::vector<KeyRangeHotStats> key_range_hot_stats_;
+
+    std::shared_ptr<BucketTableHandler> bucket_table_handler_;
+
+    std::shared_ptr<ValueZone> value_zone_;
+    struct BucketMigrationMeta {
+        uint64_t min_key = 0;
+        uint64_t max_key = 0;  // exclusive
+        SequenceNumber cutover_sequence = 0;
+        std::vector<uint8_t> subrange_bitmap;  // 1=migrating, 0=bucket-only
+    };
+    std::mutex bucket_meta_mu_;
+    std::unordered_map<size_t, BucketMigrationMeta> bucket_migration_meta_by_shard_;
 
 #ifdef PROCESSANALYSIS
     std::atomic<size_t> Total_time_elapse;

@@ -4,6 +4,11 @@
 .DS_Store
 .clang-format
 .idea
+.cursor-build*
+.cursor-cmake.log
+.clangd
+compile_commands.json
+
 
 # Build directory.
 build/
@@ -13,6 +18,8 @@ release/
 debug/
 out/
 /cmake-build-debug/include/
+.cursor-build/
+.github
 
 connection*
 *.sh

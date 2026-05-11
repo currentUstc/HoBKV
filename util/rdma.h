@@ -82,11 +82,14 @@ enum Chunk_type {
     FilterChunk = 5,
     FlushBuffer = 6,
     DataChunk = 7,
-    No_Use_Default_chunk = 8
+    BucketChunk = 8,
+    ValueZoneChunk = 9,
+    No_Use_Default_chunk = 10
 };
 static const char* EnumStrings[] = {"NULL",        "Message",          "Version_edit",
                                     "IndexChunk",  "IndexChunk_Small", "FilterChunk",
-                                    "FlushBuffer", "Default",          "No_Use_Default_chunk"};
+                                    "FlushBuffer", "Default",          "BucketChunk",
+                                    "No_Use_Default_chunk"};
 
 static char config_file_name[100] = "../connection.conf";
 
@@ -125,6 +128,30 @@ struct sst_compaction {
     size_t buffer_size;
 
 } __attribute__((packed));
+struct flush_helper_request {
+    uint64_t buffer_size;
+    uint64_t kv_count;
+} __attribute__((packed));
+struct hot_to_cold_request {
+    uint64_t shard_idx;
+} __attribute__((packed));
+struct cold_to_hot_request {
+    uint64_t shard_idx;
+    ibv_mr bucket_mr;
+    uint64_t min_key;
+    uint64_t max_key;
+    uint64_t cutover_sequence;
+} __attribute__((packed));
+static constexpr uint32_t kBucketMetaBitmapMax = 64;
+struct bucket_meta_update_request {
+    uint64_t shard_idx;
+    uint64_t bucket_idx;
+    uint64_t min_key;
+    uint64_t max_key;
+    uint64_t cutover_sequence;
+    uint32_t subrange_count;
+    uint8_t subrange_bitmap[kBucketMetaBitmapMax];
+} __attribute__((packed));
 enum RDMA_Command_Type {
     invalid_command_,
     create_qp_,
@@ -143,7 +170,11 @@ enum RDMA_Command_Type {
     retrieve_log_serialized_data,
     request_cpu_utilization,
     create_cpu_refresher,
-    cpu_utilization_heartbeat
+    cpu_utilization_heartbeat,
+    flush_helper,
+    hot_to_cold,
+    cold_to_hot,
+    bucket_meta_update
 };
 enum file_type { log_type, others };
 struct fs_sync_command {
@@ -173,6 +204,10 @@ union RDMA_Request_Content {
     sst_unpin psu;
     size_t unpinned_version_id;
     CPU_Info cpu_info;
+    flush_helper_request flush_helper;
+    hot_to_cold_request hot_to_cold;
+    cold_to_hot_request cold_to_hot;
+    bucket_meta_update_request bucket_meta_update;
 };
 union RDMA_Reply_Content {
     ibv_mr mr;

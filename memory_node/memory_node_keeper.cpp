@@ -4,15 +4,92 @@
 #include "memory_node/memory_node_keeper.h"
 
 #include "db/filename.h"
+#include "db/bucket/bucket_table_builder_memoryside.h"
 #include "db/table_cache.h"
+#include "TimberSaw/options.h"
+#include "TimberSaw/status.h"
+#include <cstdio>
+#include <algorithm>
+#include <cerrno>
+#include <cstdlib>
 #include <fstream>
 #include <list>
 #include <numa.h>
+#include <unordered_set>
 
 #include "table/table_builder_bams.h"
 #include "table/table_builder_memoryside.h"
+#include "util/coding.h"
 
 namespace TimberSaw {
+
+namespace {
+
+// 在单个 MR 上按 offset 解析 value zone 条目并提取 value。
+bool TryExtractValueFromMR(const ibv_mr* mr, uint64_t offset_units, uint64_t expected_key_index, std::string* value) {
+    if (mr == nullptr || mr->addr == nullptr || value == nullptr) {
+        return false;
+    }
+    const uint64_t byte_offset = offset_units * 8;
+    if (byte_offset + 24 > mr->length) {
+        return false;
+    }
+
+    const char* base = static_cast<const char*>(mr->addr) + byte_offset;
+    const uint64_t total_size = DecodeFixed64(base);
+    if (total_size < 32 || total_size > (64ull * 1024ull * 1024ull)) {
+        return false;
+    }
+    if (byte_offset + total_size > mr->length) {
+        return false;
+    }
+
+    const uint64_t key_index = DecodeFixed64(base + 8);
+    if (key_index != expected_key_index) {
+        return false;
+    }
+
+    const size_t value_size = static_cast<size_t>(total_size - 32);
+    value->assign(base + 24, value_size);
+    return true;
+}
+
+// 在本地所有已注册 MR 中尝试定位 offset 对应条目。
+bool TryExtractValueFromLocalPools(const std::vector<ibv_mr*>& local_mem_pool, uint64_t offset_units,
+                                   uint64_t expected_key_index, std::string* value) {
+    for (const auto* mr : local_mem_pool) {
+        if (TryExtractValueFromMR(mr, offset_units, expected_key_index, value)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// 将 key_index 转换为内部键编码。
+std::string BuildInternalKeyFromKeyIndex(uint64_t key_index) {
+    std::string user_key = std::to_string(key_index);
+    ParsedInternalKey pik(Slice(user_key), kMaxSequenceNumber, kTypeValue);
+    std::string internal_key;
+    AppendInternalKey(&internal_key, pik);
+    return internal_key;
+}
+
+bool TryParseKeyIndex(const Slice& user_key, uint64_t* key_index) {
+    if (key_index == nullptr || user_key.empty()) {
+        return false;
+    }
+    std::string key_str(user_key.data(), user_key.size());
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long long parsed = std::strtoull(key_str.c_str(), &end, 10);
+    if (errno != 0 || end == key_str.c_str() || *end != '\0') {
+        return false;
+    }
+    *key_index = static_cast<uint64_t>(parsed);
+    return true;
+}
+
+}  // namespace
 
 std::shared_ptr<RDMA_Manager> Memory_Node_Keeper::rdma_mg = std::shared_ptr<RDMA_Manager>();
 TimberSaw::Memory_Node_Keeper::Memory_Node_Keeper(bool use_sub_compaction, uint32_t tcp_port, int pr_s)
@@ -49,6 +126,11 @@ TimberSaw::Memory_Node_Keeper::Memory_Node_Keeper(bool use_sub_compaction, uint3
     }
     rdma_mg->Mempool_initialize(IndexChunk, INDEX_BLOCK_BIG, 0);
     rdma_mg->Mempool_initialize(IndexChunk_Small, INDEX_BLOCK_SMALL, 0);
+    // Initialize BucketChunk pool for BucketTable allocations (512MB per chunk)
+    // if (true) {
+    //     rdma_mg->Mempool_initialize(BucketChunk, BUCKET_SIZE, 0);
+    //     rdma_mg->Mempool_initialize(ValueZoneChunk, VALUE_ZONE_ALLOC_SIZE, 0);
+    // }
 
     //    rdma_mg->Mempool_initialize(FlushBuffer, RDMA_WRITE_BLOCK, 0);
     // TODO: actually we don't need Prefetch buffer.
@@ -114,6 +196,205 @@ Memory_Node_Keeper::~Memory_Node_Keeper() {
     }
 }
 
+Status Memory_Node_Keeper::RegisterBucketTable(uint64_t bucket_idx, char* bucket_data, size_t bucket_bytes) {
+    if (bucket_data == nullptr || bucket_bytes == 0) {
+        return Status::InvalidArgument("RegisterBucketTable: bucket data is null");
+    }
+    std::lock_guard<std::mutex> lock(bucket_table_mu_);
+    if (bucket_table_builders_.find(bucket_idx) != bucket_table_builders_.end()) {
+        return Status::OK();
+    }
+    bucket_table_builders_[bucket_idx] =
+        std::make_shared<BucketTableBuilderMemorySide>(bucket_data, bucket_bytes);
+    return Status::OK();
+}
+
+std::shared_ptr<BucketTableBuilderMemorySide> Memory_Node_Keeper::GetBucketTableBuilder(uint64_t bucket_idx) {
+    std::lock_guard<std::mutex> lock(bucket_table_mu_);
+    auto it = bucket_table_builders_.find(bucket_idx);
+    if (it == bucket_table_builders_.end()) {
+        return nullptr;
+    }
+    return it->second;
+}
+
+void Memory_Node_Keeper::RefreshBucketBitmap(BucketMigrationMeta* meta) {
+    if (meta == nullptr) {
+        return;
+    }
+    if (meta->subrange_bitmap.size() != meta->subrange_overlap_counts.size()) {
+        meta->subrange_bitmap.assign(meta->subrange_overlap_counts.size(), 0);
+    }
+    for (size_t i = 0; i < meta->subrange_overlap_counts.size(); ++i) {
+        meta->subrange_bitmap[i] = meta->subrange_overlap_counts[i] > 0 ? 1 : 0;
+    }
+}
+
+void Memory_Node_Keeper::ApplyFileRangeDeltaToMeta(BucketMigrationMeta* meta, uint64_t file_min_key, uint64_t file_max_key,
+                                                   int delta) {
+    if (meta == nullptr || meta->max_key <= meta->min_key || meta->subrange_overlap_counts.empty()) {
+        return;
+    }
+    if (file_max_key < meta->min_key || file_min_key >= meta->max_key) {
+        return;
+    }
+
+    const uint64_t overlap_start = std::max(meta->min_key, file_min_key);
+    const uint64_t overlap_end_inclusive = std::min(meta->max_key - 1, file_max_key);
+    if (overlap_start > overlap_end_inclusive) {
+        return;
+    }
+
+    const uint64_t total_span = meta->max_key - meta->min_key;
+    const uint64_t subrange_size =
+        std::max<uint64_t>(1, (total_span + meta->subrange_overlap_counts.size() - 1) / meta->subrange_overlap_counts.size());
+
+    size_t start_idx = static_cast<size_t>((overlap_start - meta->min_key) / subrange_size);
+    size_t end_idx = static_cast<size_t>((overlap_end_inclusive - meta->min_key) / subrange_size);
+    if (start_idx >= meta->subrange_overlap_counts.size()) {
+        start_idx = meta->subrange_overlap_counts.size() - 1;
+    }
+    if (end_idx >= meta->subrange_overlap_counts.size()) {
+        end_idx = meta->subrange_overlap_counts.size() - 1;
+    }
+
+    for (size_t i = start_idx; i <= end_idx; ++i) {
+        if (delta > 0) {
+            meta->subrange_overlap_counts[i] += static_cast<uint32_t>(delta);
+        } else if (delta < 0) {
+            const uint32_t d = static_cast<uint32_t>(-delta);
+            meta->subrange_overlap_counts[i] = meta->subrange_overlap_counts[i] > d ? meta->subrange_overlap_counts[i] - d : 0;
+        }
+    }
+}
+
+void Memory_Node_Keeper::RecomputeBucketMigrationMeta(BucketMigrationMeta* meta) {
+    if (meta == nullptr || meta->max_key <= meta->min_key) {
+        return;
+    }
+    meta->subrange_overlap_counts.assign(kBucketSubrangeCount, 0);
+    meta->subrange_bitmap.assign(kBucketSubrangeCount, 0);
+
+    InternalKey begin_internal(std::to_string(meta->min_key), kMaxSequenceNumber, kTypeValue);
+    InternalKey end_internal(std::to_string(meta->max_key - 1), 0, kTypeDeletion);
+    std::unordered_set<std::string> visited_files;
+
+    std::lock_guard<std::mutex> lock(versionset_mtx);
+    Version* current = versions_->current();
+    for (int level = 0; level < config::kNumLevels; ++level) {
+        std::vector<std::shared_ptr<RemoteMemTableMetaData>> inputs;
+        current->GetOverlappingInputs(level, &begin_internal, &end_internal, &inputs);
+        for (const auto& file : inputs) {
+            if (!file) {
+                continue;
+            }
+            const std::string unique_file_id =
+                std::to_string(level) + ":" + std::to_string(file->number) + ":" + std::to_string(file->creator_node_id);
+            if (!visited_files.insert(unique_file_id).second) {
+                continue;
+            }
+            uint64_t file_min_key = 0;
+            uint64_t file_max_key = 0;
+            if (TryParseKeyIndex(file->smallest.user_key(), &file_min_key) &&
+                TryParseKeyIndex(file->largest.user_key(), &file_max_key)) {
+                ApplyFileRangeDeltaToMeta(meta, file_min_key, file_max_key, +1);
+            } else {
+                for (auto& count : meta->subrange_overlap_counts) {
+                    ++count;
+                }
+            }
+        }
+    }
+    RefreshBucketBitmap(meta);
+}
+
+void Memory_Node_Keeper::SendBucketMetaUpdateToCompute(const BucketMigrationMeta& meta, const std::string& client_ip,
+                                                       uint8_t target_node_id) {
+    ibv_mr send_mr = {};
+    rdma_mg->Allocate_Local_RDMA_Slot(send_mr, Message);
+    RDMA_Request* send_pointer = reinterpret_cast<RDMA_Request*>(send_mr.addr);
+    *send_pointer = {};
+    send_pointer->command = bucket_meta_update;
+    send_pointer->content.bucket_meta_update.shard_idx = meta.shard_idx;
+    send_pointer->content.bucket_meta_update.bucket_idx = meta.bucket_idx;
+    send_pointer->content.bucket_meta_update.min_key = meta.min_key;
+    send_pointer->content.bucket_meta_update.max_key = meta.max_key;
+    send_pointer->content.bucket_meta_update.cutover_sequence = meta.cutover_sequence;
+    const uint32_t subrange_count =
+        static_cast<uint32_t>(std::min<size_t>(meta.subrange_bitmap.size(), kBucketMetaBitmapMax));
+    send_pointer->content.bucket_meta_update.subrange_count = subrange_count;
+    std::memset(send_pointer->content.bucket_meta_update.subrange_bitmap, 0, kBucketMetaBitmapMax);
+    for (uint32_t i = 0; i < subrange_count; ++i) {
+        send_pointer->content.bucket_meta_update.subrange_bitmap[i] = meta.subrange_bitmap[i];
+    }
+    rdma_mg->post_send<RDMA_Request>(&send_mr, target_node_id, client_ip);
+    ibv_wc wc[2] = {};
+    if (rdma_mg->poll_completion(wc, 1, client_ip, true, target_node_id)) {
+        std::fprintf(stderr, "bucket_meta_update: send failed, shard=%llu\n",
+                     static_cast<unsigned long long>(meta.shard_idx));
+    }
+    rdma_mg->Deallocate_Local_RDMA_Slot(send_mr.addr, Message);
+}
+
+void Memory_Node_Keeper::UpdateBucketMigrationMetaAfterCompaction(Compaction* compaction, const std::string& client_ip,
+                                                                  uint8_t target_node_id) {
+    if (compaction == nullptr) {
+        return;
+    }
+    std::vector<BucketMigrationMeta> updates_to_sync;
+    {
+        std::lock_guard<std::mutex> meta_lock(cold_to_hot_meta_mu_);
+        if (bucket_migration_meta_by_shard_.empty()) {
+            return;
+        }
+
+        for (auto& kv : bucket_migration_meta_by_shard_) {
+            BucketMigrationMeta& meta = kv.second;
+
+            for (int which = 0; which < 2; ++which) {
+                for (int i = 0; i < compaction->num_input_files(which); ++i) {
+                    const auto& file = compaction->input(which, i);
+                    if (!file) {
+                        continue;
+                    }
+                    uint64_t file_min_key = 0;
+                    uint64_t file_max_key = 0;
+                    if (TryParseKeyIndex(file->smallest.user_key(), &file_min_key) &&
+                        TryParseKeyIndex(file->largest.user_key(), &file_max_key)) {
+                        ApplyFileRangeDeltaToMeta(&meta, file_min_key, file_max_key, -1);
+                    } else {
+                        RecomputeBucketMigrationMeta(&meta);
+                    }
+                }
+            }
+
+            if (compaction->edit() != nullptr) {
+                auto* new_files = compaction->edit()->GetNewFiles();
+                for (const auto& level_file : *new_files) {
+                    const auto& file = level_file.second;
+                    if (!file) {
+                        continue;
+                    }
+                    uint64_t file_min_key = 0;
+                    uint64_t file_max_key = 0;
+                    if (TryParseKeyIndex(file->smallest.user_key(), &file_min_key) &&
+                        TryParseKeyIndex(file->largest.user_key(), &file_max_key)) {
+                        ApplyFileRangeDeltaToMeta(&meta, file_min_key, file_max_key, +1);
+                    } else {
+                        RecomputeBucketMigrationMeta(&meta);
+                    }
+                }
+            }
+
+            RefreshBucketBitmap(&meta);
+            updates_to_sync.push_back(meta);
+        }
+    }
+    for (const auto& meta : updates_to_sync) {
+        SendBucketMetaUpdateToCompute(meta, client_ip, target_node_id);
+    }
+}
+
 //  void TimberSaw::Memory_Node_Keeper::Schedule(void (*background_work_function)(void*),
 //                                             void* background_work_arg,
 //                                             ThreadPoolType type) {
@@ -150,6 +431,23 @@ void Memory_Node_Keeper::RPC_Compaction_Dispatch(void* thread_args) {
 void Memory_Node_Keeper::RPC_Garbage_Collection_Dispatch(void* thread_args) {
     BGThreadMetadata* p = static_cast<BGThreadMetadata*>(thread_args);
     ((Memory_Node_Keeper*)p->db)->sst_garbage_collection(p->func_args);
+    delete static_cast<BGThreadMetadata*>(thread_args);
+}
+void Memory_Node_Keeper::RPC_Flush_Helper_Dispatch(void* thread_args) {
+    BGThreadMetadata* p = static_cast<BGThreadMetadata*>(thread_args);
+    ((Memory_Node_Keeper*)p->db)->flush_helper_handler(p->func_args);
+    delete static_cast<BGThreadMetadata*>(thread_args);
+}
+// hot_to_cold 消息分发入口。
+void Memory_Node_Keeper::RPC_Hot_To_Cold_Dispatch(void* thread_args) {
+    BGThreadMetadata* p = static_cast<BGThreadMetadata*>(thread_args);
+    ((Memory_Node_Keeper*)p->db)->hot_to_cold_handler(p->func_args);
+    delete static_cast<BGThreadMetadata*>(thread_args);
+}
+// cold_to_hot 消息分发入口。
+void Memory_Node_Keeper::RPC_Cold_To_Hot_Dispatch(void* thread_args) {
+    BGThreadMetadata* p = static_cast<BGThreadMetadata*>(thread_args);
+    ((Memory_Node_Keeper*)p->db)->cold_to_hot_handler(p->func_args);
     delete static_cast<BGThreadMetadata*>(thread_args);
 }
 void Memory_Node_Keeper::Persistence_Dispatch(void* thread_args) {
@@ -1485,6 +1783,24 @@ void Memory_Node_Keeper::server_communication_thread(std::string client_ip, int 
             BGThreadMetadata* thread_pool_args = new BGThreadMetadata{.db = this, .func_args = argforhandler};
             Message_handler_pool_.Schedule(&Memory_Node_Keeper::RPC_Garbage_Collection_Dispatch, thread_pool_args);
             // TODO: add a handle function for the option value
+        } else if (receive_msg_buf->command == flush_helper) {
+            rdma_mg->post_receive<RDMA_Request>(&recv_mr[buffer_position], compute_node_id, client_ip);
+            Arg_for_handler* argforhandler = new Arg_for_handler{
+                .request = receive_msg_buf, .client_ip = client_ip, .target_node_id = compute_node_id};
+            BGThreadMetadata* thread_pool_args = new BGThreadMetadata{.db = this, .func_args = argforhandler};
+            Message_handler_pool_.Schedule(&Memory_Node_Keeper::RPC_Flush_Helper_Dispatch, thread_pool_args);
+        } else if (receive_msg_buf->command == hot_to_cold) {
+            rdma_mg->post_receive<RDMA_Request>(&recv_mr[buffer_position], compute_node_id, client_ip);
+            Arg_for_handler* argforhandler = new Arg_for_handler{
+                .request = receive_msg_buf, .client_ip = client_ip, .target_node_id = compute_node_id};
+            BGThreadMetadata* thread_pool_args = new BGThreadMetadata{.db = this, .func_args = argforhandler};
+            Message_handler_pool_.Schedule(&Memory_Node_Keeper::RPC_Hot_To_Cold_Dispatch, thread_pool_args);
+        } else if (receive_msg_buf->command == cold_to_hot) {
+            rdma_mg->post_receive<RDMA_Request>(&recv_mr[buffer_position], compute_node_id, client_ip);
+            Arg_for_handler* argforhandler = new Arg_for_handler{
+                .request = receive_msg_buf, .client_ip = client_ip, .target_node_id = compute_node_id};
+            BGThreadMetadata* thread_pool_args = new BGThreadMetadata{.db = this, .func_args = argforhandler};
+            Message_handler_pool_.Schedule(&Memory_Node_Keeper::RPC_Cold_To_Hot_Dispatch, thread_pool_args);
         } else if (receive_msg_buf->command == version_unpin_) {
             rdma_mg->post_receive<RDMA_Request>(&recv_mr[buffer_position], compute_node_id, client_ip);
             version_unpin_handler(receive_msg_buf, client_ip);
@@ -1988,6 +2304,291 @@ void Memory_Node_Keeper::sst_garbage_collection(void* arg) {
     delete (Arg_for_handler*)arg;
 }
 
+void Memory_Node_Keeper::flush_helper_handler(void* arg) {
+    RDMA_Request* request = ((Arg_for_handler*)arg)->request;
+    std::string client_ip = ((Arg_for_handler*)arg)->client_ip;
+    uint8_t target_node_id = ((Arg_for_handler*)arg)->target_node_id;
+
+    const uint64_t buffer_size = request->content.flush_helper.buffer_size;
+    const uint64_t kv_count_in = request->content.flush_helper.kv_count;
+
+    ibv_mr updates_mr = {};
+    rdma_mg->Allocate_Local_RDMA_Slot(updates_mr, FlushBuffer);
+    if (buffer_size > updates_mr.length) {
+        rdma_mg->Deallocate_Local_RDMA_Slot(updates_mr.addr, FlushBuffer);
+        delete request;
+        delete (Arg_for_handler*)arg;
+        return;
+    }
+
+    ibv_mr remote_mr = {};
+    remote_mr.addr = request->buffer_large;
+    remote_mr.rkey = request->rkey_large;
+    if (buffer_size > 0) {
+        rdma_mg->RDMA_Read(&remote_mr, &updates_mr, buffer_size, client_ip, IBV_SEND_SIGNALED, 1, target_node_id);
+    }
+
+    const size_t pair_size = sizeof(uint64_t) * 2;
+    const size_t max_kv_count = buffer_size / pair_size;
+    const size_t kv_count = kv_count_in < max_kv_count ? kv_count_in : max_kv_count;
+
+    const char* ptr = static_cast<const char*>(updates_mr.addr);
+    size_t error_count = 0;
+    const size_t kMaxErrorLogs = 10;
+    for (size_t i = 0; i < kv_count; ++i) {
+        const uint64_t key_index = DecodeFixed64(ptr);
+        const uint64_t offset_units = DecodeFixed64(ptr + sizeof(uint64_t));
+        const uint64_t bucket_idx = key_index / SLOT_NUM_PER_BUCKET;
+        const uint64_t slot_idx = key_index % SLOT_NUM_PER_BUCKET;
+
+        if (bucket_idx >= BUCKET_NUMBER) {
+            if (error_count < kMaxErrorLogs) {
+                std::fprintf(stderr, "flush_helper: key_index %llu out of bucket range\n",
+                             static_cast<unsigned long long>(key_index));
+            }
+            error_count++;
+            ptr += pair_size;
+            continue;
+        }
+
+        auto builder = GetBucketTableBuilder(bucket_idx);
+        if (!builder) {
+            if (error_count < kMaxErrorLogs) {
+                std::fprintf(stderr, "flush_helper: bucket %llu not registered\n",
+                             static_cast<unsigned long long>(bucket_idx));
+            }
+            error_count++;
+            ptr += pair_size;
+            continue;
+        }
+
+        Status s = builder->UpdateSlot(slot_idx, offset_units);
+        if (!s.ok()) {
+            if (error_count < kMaxErrorLogs) {
+                std::fprintf(stderr, "flush_helper: update slot failed: %s\n", s.ToString().c_str());
+            }
+            error_count++;
+        }
+        ptr += pair_size;
+    }
+
+    ibv_mr send_mr = {};
+    rdma_mg->Allocate_Local_RDMA_Slot(send_mr, Message);
+    RDMA_Reply* send_pointer = (RDMA_Reply*)send_mr.addr;
+    send_pointer->received = true;
+    rdma_mg->RDMA_Write(request->buffer, request->rkey, &send_mr, sizeof(RDMA_Reply), client_ip, IBV_SEND_SIGNALED, 1,
+                        target_node_id);
+
+    rdma_mg->Deallocate_Local_RDMA_Slot(send_mr.addr, Message);
+    rdma_mg->Deallocate_Local_RDMA_Slot(updates_mr.addr, FlushBuffer);
+    delete request;
+    delete (Arg_for_handler*)arg;
+}
+
+// 处理 hot_to_cold 请求：根据 shard_idx 映射单个 bucket 并启动后台线程构建新 SST。
+void Memory_Node_Keeper::hot_to_cold_handler(void* arg) {
+    RDMA_Request* request = ((Arg_for_handler*)arg)->request;
+    std::string client_ip = ((Arg_for_handler*)arg)->client_ip;
+    uint8_t target_node_id = ((Arg_for_handler*)arg)->target_node_id;
+
+    const uint64_t shard_idx = request->content.hot_to_cold.shard_idx;
+    const uint64_t bucket_idx = shard_idx % BUCKET_NUMBER;
+    {
+        std::lock_guard<std::mutex> lock(cold_to_hot_meta_mu_);
+        bucket_migration_meta_by_shard_.erase(shard_idx);
+    }
+    const std::string client_ip_copy = client_ip;
+    const uint8_t target_node_id_copy = target_node_id;
+
+    std::thread hot_to_cold_thread([this, shard_idx, bucket_idx, client_ip_copy, target_node_id_copy]() {
+        this->hot_to_cold_worker(shard_idx, bucket_idx, client_ip_copy, target_node_id_copy);
+    });
+    hot_to_cold_thread.detach();
+
+    ibv_mr send_mr = {};
+    rdma_mg->Allocate_Local_RDMA_Slot(send_mr, Message);
+    RDMA_Reply* send_pointer = (RDMA_Reply*)send_mr.addr;
+    send_pointer->received = true;
+    rdma_mg->RDMA_Write(request->buffer, request->rkey, &send_mr, sizeof(RDMA_Reply), client_ip, IBV_SEND_SIGNALED, 1,
+                        target_node_id);
+
+    rdma_mg->Deallocate_Local_RDMA_Slot(send_mr.addr, Message);
+    delete request;
+    delete (Arg_for_handler*)arg;
+}
+
+// 处理 cold_to_hot 请求：仅建立 bucket 元数据，采用 lazy 回迁。
+void Memory_Node_Keeper::cold_to_hot_handler(void* arg) {
+    RDMA_Request* request = ((Arg_for_handler*)arg)->request;
+    std::string client_ip = ((Arg_for_handler*)arg)->client_ip;
+    uint8_t target_node_id = ((Arg_for_handler*)arg)->target_node_id;
+
+    const uint64_t shard_idx = request->content.cold_to_hot.shard_idx;
+    const uint64_t bucket_idx = shard_idx % BUCKET_NUMBER;
+    const uint64_t min_key = request->content.cold_to_hot.min_key;
+    const uint64_t max_key = request->content.cold_to_hot.max_key;
+    const SequenceNumber cutover_sequence = request->content.cold_to_hot.cutover_sequence;
+
+    ibv_mr bucket_mr = request->content.cold_to_hot.bucket_mr;
+    if (bucket_mr.addr != nullptr) {
+        std::lock_guard<std::mutex> lock(bucket_table_mu_);
+        bucket_table_mrs_[bucket_idx] = bucket_mr;
+        bucket_table_builders_[bucket_idx] =
+            std::make_shared<BucketTableBuilderMemorySide>(static_cast<char*>(bucket_mr.addr), bucket_mr.length);
+    }
+
+    BucketMigrationMeta meta;
+    meta.shard_idx = shard_idx;
+    meta.bucket_idx = bucket_idx;
+    meta.min_key = min_key;
+    meta.max_key = max_key;
+    meta.cutover_sequence = cutover_sequence;
+    meta.subrange_overlap_counts.assign(kBucketSubrangeCount, 0);
+    meta.subrange_bitmap.assign(kBucketSubrangeCount, 0);
+    RecomputeBucketMigrationMeta(&meta);
+
+    size_t migrating_subranges = 0;
+    for (uint8_t bit : meta.subrange_bitmap) {
+        if (bit != 0) {
+            ++migrating_subranges;
+        }
+    }
+    const size_t bucket_only_subranges = meta.subrange_bitmap.size() - migrating_subranges;
+
+    {
+        std::lock_guard<std::mutex> lock(cold_to_hot_meta_mu_);
+        bucket_migration_meta_by_shard_[shard_idx] = meta;
+    }
+    SendBucketMetaUpdateToCompute(meta, client_ip, target_node_id);
+
+    std::fprintf(stdout,
+                 "cold_to_hot(meta): shard=%llu, bucket=%llu, key_range=[%llu,%llu), cutover=%llu, "
+                 "migrating_subranges=%zu, bucket_only_subranges=%zu\n",
+                 static_cast<unsigned long long>(shard_idx), static_cast<unsigned long long>(bucket_idx),
+                 static_cast<unsigned long long>(min_key),
+                 static_cast<unsigned long long>(max_key), static_cast<unsigned long long>(cutover_sequence),
+                 migrating_subranges, bucket_only_subranges);
+
+    ibv_mr send_mr = {};
+    rdma_mg->Allocate_Local_RDMA_Slot(send_mr, Message);
+    RDMA_Reply* send_pointer = (RDMA_Reply*)send_mr.addr;
+    send_pointer->received = true;
+    rdma_mg->RDMA_Write(request->buffer, request->rkey, &send_mr, sizeof(RDMA_Reply), client_ip, IBV_SEND_SIGNALED, 1,
+                        target_node_id);
+
+    rdma_mg->Deallocate_Local_RDMA_Slot(send_mr.addr, Message);
+    delete request;
+    delete (Arg_for_handler*)arg;
+}
+
+// 热转冷后台任务：读取 bucket 中的 KV，并在内存侧生成新的 SSTable。
+void Memory_Node_Keeper::hot_to_cold_worker(uint64_t shard_idx, uint64_t bucket_idx, std::string client_ip,
+                                            uint8_t target_node_id) {
+    struct KVItem {
+        uint64_t key_index;
+        std::string value;
+    };
+
+    std::vector<KVItem> kv_items;
+    auto builder = GetBucketTableBuilder(bucket_idx);
+    if (builder) {
+        const uint64_t max_slots = builder->MaxSlots();
+        for (uint64_t slot_idx = 0; slot_idx < max_slots; ++slot_idx) {
+            uint64_t offset_units = 0;
+            Status read_status = builder->ReadSlot(slot_idx, &offset_units);
+            if (!read_status.ok() || offset_units == 0) {
+                continue;
+            }
+
+            const uint64_t key_index = bucket_idx * SLOT_NUM_PER_BUCKET + slot_idx;
+            std::string value;
+            if (!TryExtractValueFromLocalPools(rdma_mg->local_mem_pool, offset_units, key_index, &value)) {
+                continue;
+            }
+            kv_items.push_back({key_index, std::move(value)});
+        }
+    }
+
+    if (kv_items.empty()) {
+        std::fprintf(stdout, "hot_to_cold worker: shard=%llu has no kv to build\n",
+                     static_cast<unsigned long long>(shard_idx));
+        return;
+    }
+
+    // std::sort(kv_items.begin(), kv_items.end(),
+    //           [](const KVItem& lhs, const KVItem& rhs) { return lhs.key_index < rhs.key_index; });
+
+    auto meta = std::make_shared<RemoteMemTableMetaData>(1);
+    meta->shard_target_node_id = rdma_mg->node_id;
+    meta->level = 1;
+    meta->table_type = block_based;
+    {
+        std::lock_guard<std::mutex> lock(versionset_mtx);
+        meta->number = versions_->NewFileNumber();
+    }
+
+    TableBuilder* sst_builder = new TableBuilder_Memoryside(*opts, Flush, rdma_mg);
+    bool has_key = false;
+    for (const auto& kv : kv_items) {
+        std::string internal_key = BuildInternalKeyFromKeyIndex(kv.key_index);
+        if (!has_key) {
+            meta->smallest.DecodeFrom(Slice(internal_key));
+            has_key = true;
+        }
+        meta->largest.DecodeFrom(Slice(internal_key));
+        sst_builder->Add(Slice(internal_key), Slice(kv.value));
+    }
+
+    Status finish_status = sst_builder->Finish();
+    sst_builder->get_datablocks_map(meta->remote_data_mrs);
+    sst_builder->get_dataindexblocks_map(meta->remote_dataindex_mrs);
+    sst_builder->get_filter_map(meta->remote_filter_mrs);
+    meta->num_entries = sst_builder->get_numentries();
+    meta->file_size = sst_builder->FileSize();
+    delete sst_builder;
+
+    if (!finish_status.ok()) {
+        std::fprintf(stderr, "hot_to_cold worker: build sstable failed, shard=%llu, err=%s\n",
+                     static_cast<unsigned long long>(shard_idx), finish_status.ToString().c_str());
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(cold_to_hot_meta_mu_);
+        cold_to_hot_pending_ssts_.push_back(meta);
+    }
+
+    VersionEdit edit(0);
+    edit.AddFile(1, meta);
+    {
+        std::unique_lock<std::mutex> lck(versionset_mtx);
+        Status apply_status = versions_->LogAndApply(&edit);
+        if (!apply_status.ok()) {
+            std::fprintf(stderr,
+                         "hot_to_cold worker: LogAndApply failed, shard=%llu, err=%s\n",
+                         static_cast<unsigned long long>(shard_idx), apply_status.ToString().c_str());
+            return;
+        }
+        Edit_sync_to_remote(&edit, client_ip, &lck, target_node_id);
+    }
+
+    size_t cleared_slots = 0;
+    if (builder) {
+        const uint64_t max_slots = builder->MaxSlots();
+        for (uint64_t slot_idx = 0; slot_idx < max_slots; ++slot_idx) {
+            Status clear_status = builder->UpdateSlot(slot_idx, 0);
+            if (clear_status.ok()) {
+                ++cleared_slots;
+            }
+        }
+    }
+
+    std::fprintf(stdout,
+                 "hot_to_cold worker: built sstable #%llu at L1, shard=%llu, bucket=%llu, entries=%zu, cleared=%zu\n",
+                 static_cast<unsigned long long>(meta->number), static_cast<unsigned long long>(shard_idx),
+                 static_cast<unsigned long long>(bucket_idx), meta->num_entries, cleared_slots);
+}
+
 void Memory_Node_Keeper::sst_compaction_handler(void* arg) {
     RDMA_Request* request = ((Arg_for_handler*)arg)->request;
     std::string client_ip = ((Arg_for_handler*)arg)->client_ip;
@@ -2083,6 +2684,7 @@ void Memory_Node_Keeper::sst_compaction_handler(void* arg) {
         status = DoCompactionWork(compact, client_ip);
     }
     InstallCompactionResultsToComputePreparation(compact);
+    UpdateBucketMigrationMetaAfterCompaction(compact->compaction, client_ip, target_node_id);
     // TODO:Send back the new created sstables and wait for another reply.
     std::string serilized_ve;
 #ifndef NDEBUG

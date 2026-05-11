@@ -21,7 +21,9 @@
 #include "table/merger.h"
 #include "table/table_builder_bacs.h"
 #include "table/table_builder_computeside.h"
+#include "bucket/bucket_table_builder.h"
 #include "util/coding.h"
+#include "util/rdma.h"
 namespace TimberSaw {
 
 // std::mutex MemTableList::imm_mtx;
@@ -804,8 +806,8 @@ void FlushJob::SetAllMemStateProcessing() {
         iter->SetFlushState(MemTable::FLUSH_PROCESSING);
     }
 }
-FlushJob::FlushJob(std::condition_variable* write_stall_cv, const InternalKeyComparator* cmp)
-    : write_stall_cv_(write_stall_cv), user_cmp(cmp) {}
+FlushJob::FlushJob(std::condition_variable* write_stall_cv, const InternalKeyComparator* cmp, DBImpl* db_impl)
+    : write_stall_cv_(write_stall_cv), user_cmp(cmp), db_impl_(db_impl) {}
 Status FlushJob::BuildTable(const std::string& dbname, Env* env, const Options& options, TableCache* table_cache,
                             Iterator* iter, const std::shared_ptr<RemoteMemTableMetaData>& meta, IO_type type,
                             uint8_t target_node_id, Table_Type table_type) {
@@ -820,7 +822,20 @@ Status FlushJob::BuildTable(const std::string& dbname, Env* env, const Options& 
     std::string current_user_key;
     bool has_current_user_key = false;
     TableBuilder* builder;
+    std::shared_ptr<ValueZone> hot_value_zone;
+    std::shared_ptr<RDMA_Manager> hot_rdma_mg;
+    uint8_t hot_target_node_id = 0;
+    if (db_impl_ != nullptr) {
+        hot_value_zone = db_impl_->GetValueZone();
+        hot_rdma_mg = db_impl_->GetRDMA_Manager();
+        hot_target_node_id = db_impl_->GetShardTargetNodeId();
+    }
+    const bool collect_hot_kv = (db_impl_ != nullptr && hot_value_zone != nullptr && hot_rdma_mg != nullptr);
+    BucketTableBuilder hot_builder(collect_hot_kv ? hot_value_zone : nullptr,
+                                   collect_hot_kv ? hot_rdma_mg : nullptr,
+                                   hot_target_node_id);
     if (iter->Valid()) {
+        // TODO: processing the KVs in hot area
         if (table_type == block_based) {
             builder = new TableBuilder_ComputeSide(options, type, target_node_id);
 
@@ -860,6 +875,9 @@ Status FlushJob::BuildTable(const std::string& dbname, Env* env, const Options& 
                 Not_drop_counter++;
 #endif
                 builder->Add(key, iter->value());
+                if (collect_hot_kv && db_impl_->IsHotKey(ikey.user_key)) {
+                    hot_builder.Add(ikey.user_key, iter->value());
+                }
             }
         }
 
@@ -876,6 +894,9 @@ Status FlushJob::BuildTable(const std::string& dbname, Env* env, const Options& 
         // Finish and check for builder errors
 
         s = builder->Finish();
+        if (collect_hot_kv) {
+            hot_builder.Finish();
+        }
         builder->get_datablocks_map(meta->remote_data_mrs);
         builder->get_dataindexblocks_map(meta->remote_dataindex_mrs);
         builder->get_filter_map(meta->remote_filter_mrs);

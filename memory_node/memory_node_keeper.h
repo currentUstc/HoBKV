@@ -6,6 +6,8 @@
 #define TimberSaw_HOME_NODE_KEEPER_H
 
 #include <queue>
+#include <unordered_map>
+#include <mutex>
 // #include <fcntl.h>
 #include "db/log_writer.h"
 #include "db/version_set.h"
@@ -15,6 +17,8 @@
 #include "util/rdma.h"
 
 namespace TimberSaw {
+
+class BucketTableBuilderMemorySide;
 
 struct Arg_for_persistent {
     VersionEdit_Merger* edit_merger;
@@ -34,10 +38,14 @@ public:
     // this function is for the server.
     void Server_to_Client_Communication();
     void SetBackgroundThreads(int num, ThreadPoolType type);
+    Status RegisterBucketTable(uint64_t bucket_idx, char* bucket_data, size_t bucket_bytes);
     //  void MaybeScheduleCompaction(std::string& client_ip);
     //  static void BGWork_Compaction(void* thread_args);
     static void RPC_Compaction_Dispatch(void* thread_args);
     static void RPC_Garbage_Collection_Dispatch(void* thread_args);
+    static void RPC_Flush_Helper_Dispatch(void* thread_args);
+    static void RPC_Hot_To_Cold_Dispatch(void* thread_args);
+    static void RPC_Cold_To_Hot_Dispatch(void* thread_args);
     static void Persistence_Dispatch(void* thread_args);
     //  void BackgroundCompaction(void* p);
     void CleanupCompaction(CompactionState* compact);
@@ -180,11 +188,43 @@ private:
 
     void sst_compaction_handler(void* arg);
 
+    void flush_helper_handler(void* arg);
+    void hot_to_cold_handler(void* arg);
+    void hot_to_cold_worker(uint64_t shard_idx, uint64_t bucket_idx, std::string client_ip, uint8_t target_node_id);
+    void cold_to_hot_handler(void* arg);
+
     void qp_reset_handler(RDMA_Request* request, std::string& client_ip, int socket_fd, uint8_t target_node_id);
     void sync_option_handler(RDMA_Request* request, std::string& client_ip, uint8_t target_node_id);
     void version_unpin_handler(RDMA_Request* request, std::string& client_ip);
     void Edit_sync_to_remote(VersionEdit* edit, std::string& client_ip, std::unique_lock<std::mutex>* version_mtx,
                              uint8_t target_node_id);
+
+    std::shared_ptr<BucketTableBuilderMemorySide> GetBucketTableBuilder(uint64_t bucket_idx);
+    struct BucketMigrationMeta {
+        uint64_t shard_idx = 0;
+        uint64_t bucket_idx = 0;
+        uint64_t min_key = 0;
+        uint64_t max_key = 0;  // exclusive
+        SequenceNumber cutover_sequence = 0;
+        std::vector<uint32_t> subrange_overlap_counts;
+        std::vector<uint8_t> subrange_bitmap;  // 1=migrating, 0=bucket-only
+    };
+    static constexpr uint32_t kBucketSubrangeCount = 64;
+    void RecomputeBucketMigrationMeta(BucketMigrationMeta* meta);
+    void ApplyFileRangeDeltaToMeta(BucketMigrationMeta* meta, uint64_t file_min_key, uint64_t file_max_key, int delta);
+    void RefreshBucketBitmap(BucketMigrationMeta* meta);
+    void UpdateBucketMigrationMetaAfterCompaction(Compaction* compaction, const std::string& client_ip,
+                                                  uint8_t target_node_id);
+    void SendBucketMetaUpdateToCompute(const BucketMigrationMeta& meta, const std::string& client_ip,
+                                       uint8_t target_node_id);
+
+    std::mutex bucket_table_mu_;
+    std::unordered_map<uint64_t, std::shared_ptr<BucketTableBuilderMemorySide>> bucket_table_builders_;
+    std::unordered_map<uint64_t, ibv_mr> bucket_table_mrs_;
+
+    std::mutex cold_to_hot_meta_mu_;
+    std::vector<std::shared_ptr<RemoteMemTableMetaData>> cold_to_hot_pending_ssts_;
+    std::unordered_map<uint64_t, BucketMigrationMeta> bucket_migration_meta_by_shard_;
 };
 }  // namespace TimberSaw
 #endif  // TimberSaw_HOME_NODE_KEEPER_H

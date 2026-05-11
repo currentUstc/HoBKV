@@ -32,6 +32,7 @@
 namespace TimberSaw {
 
 class InternalKeyComparator;
+class DBImpl;
 
 class MergeIteratorBuilder;
 class MemTableList;
@@ -407,13 +408,16 @@ private:
 };
 class FlushJob {
 public:
-    explicit FlushJob(std::condition_variable* write_stall_cv, const InternalKeyComparator* cmp);
+    explicit FlushJob(std::condition_variable* write_stall_cv, const InternalKeyComparator* cmp, DBImpl* db_impl);
     autovector<MemTable*> mem_vec;
 
     //  std::mutex* imm_mtx_;
     std::condition_variable* write_stall_cv_;
     std::shared_ptr<RemoteMemTableMetaData> sst;
     const InternalKeyComparator* user_cmp;
+    DBImpl* db_impl_;
+    std::string hot_kv_buffer;
+    size_t hot_kv_count = 0;
     void Waitforpendingwriter();
     void SetAllMemStateProcessing();
     Status BuildTable(const std::string& dbname, Env* env, const Options& options, TableCache* table_cache,

@@ -29,6 +29,12 @@ Options::Options() : comparator(BytewiseComparator()), env(Env::Default()) {
         char* buff;
         // TODO: maybe we don't need the code below. because we use thread local buffer.
         env->rdma_mg->Local_Memory_Register(&buff, &mr, 1024 * 1024 * 1024, DataChunk);
+
+        // BucketLSM
+        if (true) {
+            env->rdma_mg->Mempool_initialize(BucketChunk, BUCKET_SIZE, 0);
+            env->rdma_mg->Mempool_initialize(ValueZoneChunk, VALUE_ZONE_ALLOC_SIZE, 0);
+        }
     }
 
     env->initialized = true;

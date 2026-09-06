@@ -143,11 +143,10 @@ TimberSaw::Memory_Node_Keeper::Memory_Node_Keeper(bool use_sub_compaction, uint3
     }
     rdma_mg->Mempool_initialize(IndexChunk, INDEX_BLOCK_BIG, 0);
     rdma_mg->Mempool_initialize(IndexChunk_Small, INDEX_BLOCK_SMALL, 0);
-    // Initialize BucketChunk pool for BucketTable allocations (512MB per chunk)
-    // if (true) {
-    //     rdma_mg->Mempool_initialize(BucketChunk, BUCKET_SIZE, 0);
-    //     rdma_mg->Mempool_initialize(ValueZoneChunk, VALUE_ZONE_ALLOC_SIZE, 0);
-    // }
+    // Bucket/value-zone allocation requests use distinct chunk sizes and must
+    // be registered in the memory-side allocator before the first hot shard.
+    rdma_mg->Mempool_initialize(BucketChunk, BUCKET_SIZE, 0);
+    rdma_mg->Mempool_initialize(ValueZoneChunk, VALUE_ZONE_ALLOC_SIZE, 0);
 
     //    rdma_mg->Mempool_initialize(FlushBuffer, RDMA_WRITE_BLOCK, 0);
     // TODO: actually we don't need Prefetch buffer.

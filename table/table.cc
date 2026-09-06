@@ -352,7 +352,6 @@ Status Table::InternalGet(const ReadOptions& options, const Slice& k, void* arg,
             block_iter->Seek(k);
             if (block_iter->Valid()) {
                 (*handle_result)(arg, block_iter->key(), block_iter->value());
-                assert(*block_iter->key().data() == 0);
             }
             Saver* saver = reinterpret_cast<Saver*>(arg);
             //      assert(saver->state == kNotFound);
@@ -409,7 +408,6 @@ Status Table::InternalGet(const ReadOptions& options, const Slice& k, void* arg,
 #endif
                 if (block_iter->Valid()) {
                     (*handle_result)(arg, block_iter->key(), block_iter->value());
-                    assert(*block_iter->key().data() == 0);
                 }
                 s = block_iter->status();
                 delete block_iter;

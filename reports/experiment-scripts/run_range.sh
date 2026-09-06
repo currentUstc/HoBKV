@@ -11,8 +11,8 @@ esac
 node4=${NODE4:-REDACTED}
 node6=${NODE6:-REDACTED}
 remote_root=${REMOTE_ROOT:-/tmp/dlsm-hotcold-20260906-1349}
-server_bin=${SERVER_BIN:-$remote_root/build/Server.bucket-scan-v34}
-compute_bin=${COMPUTE_BIN:-$remote_root/build/db_bench.bucket-scan-v34}
+server_bin=${SERVER_BIN:-$remote_root/build/Server.bucket-scan-mvcc-v35}
+compute_bin=${COMPUTE_BIN:-$remote_root/build/db_bench.bucket-scan-mvcc-v35}
 result_root=${RESULT_ROOT:-/home/k8s/liuyang/dlsm-zippy-cpu-sweep-20260907/range}
 run_dir="$result_root/$mode-10c"
 mkdir -p "$run_dir"

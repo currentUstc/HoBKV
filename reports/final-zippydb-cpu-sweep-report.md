@@ -15,8 +15,8 @@ node6 固定使用 16 个前台线程；node4 Server 使用与 RDMA 网卡相同
 - 独立 Get 在全部核心配置下均提升，提升范围为 2.5%～19.4%；10 核时提升 5.1%。
 - 混合负载在全部核心配置下均为正提升，提升范围为 1.4%～49.7%；10 核时提升 15.5%。
 - 4 核及以上时，优化版 node4 Server 的完整运行平均 CPU 通常低于 baseline；计算节点 CPU 略高。
-- 10 核范围查询 batch helper 恢复了 bucket 数据的可见性，`bucket_errors=0`，但吞吐比 baseline
-  低 72.2%，尚未达到“性能损失不超过 30%”的目标。
+- 10 核范围查询 batch helper 恢复了 bucket 数据的可见性，MVCC v35 的 `bucket_errors=0`，但吞吐比
+  baseline 低 72.0%，尚未达到“性能损失不超过 30%”的目标。
 - 10 核是当前较均衡的展示配置：Put、Get、混合负载分别提升 40.1%、5.1%、15.5%。
 
 ## 2. Baseline 与两侧算力部署方式
@@ -188,5 +188,40 @@ node4 每个范围请求都会线性遍历全部 `latest_bucket_sequence_by_key_
 - CPU sweep runner：`reports/experiment-scripts/run_sweep.sh`
 - range runner：`reports/experiment-scripts/run_range.sh`
 
-最终结论应以本报告第 4、6、7 节及上述 v26/v34 原始数据为准，旧报告中的早期单轮或错误 memtable
+最终结论应以本报告第 4、6、7、10 节及上述 v26/v34/v35 原始数据为准，旧报告中的早期单轮或错误 memtable
 配置结果仅作为排障历史，不应继续作为论文主结果引用。
+
+## 10. MVCC scan 并发改造（v35）
+
+为避免只读 helper 在提取和复制 value 时长期持有全局更新锁，v35 增加了 bucket/value-zone MVCC：
+
+- value-zone 新版本发布前，把旧 bucket head 写入记录的 `prev_offset`；
+- bucket slot 最后发布新 head，value 记录发布后保持不可变；
+- scan 只在共享锁内快照范围内的 key 与 head offset，随后在锁外按
+  `sequence <= snapshot_sequence` 沿版本链选择可见版本；
+- hot-to-cold 在共享锁下取得 slot 快照、锁外构建 SST，完成后仅清除仍指向该快照版本的 slot，
+  不会删除迁移期间写入的新版本。
+
+10 核、16 个 scan 线程、160 个查询、每次 64 个逻辑 key 的结果：
+
+| 指标 | Baseline | batch helper v34 | MVCC helper v35 |
+|---|---:|---:|---:|
+| 返回条目 | 12,785 | 12,784 | 12,783 |
+| bucket 错误 | 不适用 | 0 | 0 |
+| 总耗时 | 244.296ms | 878.737ms | 871.629ms |
+| 查询吞吐 | 654.9 query/s | 182.1 query/s | 183.6 query/s |
+| 条目吞吐 | 52,334 entry/s | 14,548 entry/s | 14,666 entry/s |
+| 相对 v34 | — | — | **+0.8%** |
+| 相对 baseline | — | -72.2% | **-72.0%** |
+
+完整运行平均进程 CPU：v35 node4 为 329.45%，node6 为 216.71%；峰值 RSS 分别为
+88.53GiB 和 3.81GiB。
+
+MVCC 解决了 bucket 元数据与不可变 value 版本之间的并发一致性，并把大 value 复制移出全局更新锁，
+但对本轮吞吐改善很小。原因是 scan RPC 在 node6 仍由 `main_send_cq_mutex` 覆盖“发送到等待完整回复”
+的全过程，16 个前台线程实际串行；node4 的 `Message_handler_pool_` 只有 2 个 worker；每个 RPC 仍线性
+遍历全部 `latest_bucket_sequence_by_key_`。因此下一阶段要提高性能，应优先拆分每线程/每 QP 的完成队列
+并建立按 key 或 subrange 有序的范围索引，而不是继续扩大 MVCC 锁优化范围。
+
+v35 原始数据：
+`/home/k8s/liuyang/dlsm-zippy-cpu-sweep-20260907/results-v26-lock-scope/range/post-helper-mvcc-v35/hotcold-10c`。

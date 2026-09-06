@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <list>
+#include <limits>
 #include <numa.h>
 #include <unordered_set>
 
@@ -25,38 +26,61 @@ namespace TimberSaw {
 
 namespace {
 
+bool CopyFromValueZone(const std::vector<ibv_mr*>& value_zone_mrs, uint64_t byte_offset,
+                       char* dst, size_t size) {
+    size_t copied = 0;
+    while (copied < size) {
+        const size_t mr_index = byte_offset / VALUE_ZONE_ALLOC_SIZE;
+        const size_t offset_in_mr = byte_offset % VALUE_ZONE_ALLOC_SIZE;
+        if (mr_index >= value_zone_mrs.size()) {
+            return false;
+        }
+        const ibv_mr* mr = value_zone_mrs[mr_index];
+        if (mr == nullptr || mr->addr == nullptr || offset_in_mr >= mr->length) {
+            return false;
+        }
+        const size_t chunk = std::min(size - copied, mr->length - offset_in_mr);
+        std::memcpy(dst + copied, static_cast<const char*>(mr->addr) + offset_in_mr, chunk);
+        copied += chunk;
+        byte_offset += chunk;
+    }
+    return true;
+}
+
+bool CopyToValueZone(const std::vector<ibv_mr*>& value_zone_mrs, uint64_t byte_offset,
+                     const char* src, size_t size) {
+    size_t copied = 0;
+    while (copied < size) {
+        const size_t mr_index = byte_offset / VALUE_ZONE_ALLOC_SIZE;
+        const size_t offset_in_mr = byte_offset % VALUE_ZONE_ALLOC_SIZE;
+        if (mr_index >= value_zone_mrs.size()) {
+            return false;
+        }
+        ibv_mr* mr = value_zone_mrs[mr_index];
+        if (mr == nullptr || mr->addr == nullptr || offset_in_mr >= mr->length) {
+            return false;
+        }
+        const size_t chunk = std::min(size - copied, mr->length - offset_in_mr);
+        std::memcpy(static_cast<char*>(mr->addr) + offset_in_mr, src + copied, chunk);
+        copied += chunk;
+        byte_offset += chunk;
+    }
+    return true;
+}
+
 // Decode an entry by its logical value-zone offset.  An entry may cross a
 // 1 GB MR boundary, so assemble it from consecutive value-zone MRs first.
 bool TryExtractValueFromValueZone(const std::vector<ibv_mr*>& value_zone_mrs, uint64_t offset_units,
                                   uint64_t expected_key_index, std::string* key, std::string* value,
-                                  SequenceNumber* sequence, ValueType* value_type) {
+                                  SequenceNumber* sequence, ValueType* value_type,
+                                  uint64_t* previous_offset_units) {
     if (key == nullptr || value == nullptr || sequence == nullptr || value_type == nullptr) {
         return false;
     }
 
-    auto copy_from_zone = [&value_zone_mrs](uint64_t byte_offset, char* dst, size_t size) {
-        size_t copied = 0;
-        while (copied < size) {
-            const size_t mr_index = byte_offset / VALUE_ZONE_ALLOC_SIZE;
-            const size_t offset_in_mr = byte_offset % VALUE_ZONE_ALLOC_SIZE;
-            if (mr_index >= value_zone_mrs.size()) {
-                return false;
-            }
-            const ibv_mr* mr = value_zone_mrs[mr_index];
-            if (mr == nullptr || mr->addr == nullptr || offset_in_mr >= mr->length) {
-                return false;
-            }
-            const size_t chunk = std::min(size - copied, mr->length - offset_in_mr);
-            std::memcpy(dst + copied, static_cast<const char*>(mr->addr) + offset_in_mr, chunk);
-            copied += chunk;
-            byte_offset += chunk;
-        }
-        return true;
-    };
-
     const uint64_t byte_offset = offset_units * VALUE_ZONE_OFFSET_UNIT;
     char header[48];
-    if (!copy_from_zone(byte_offset, header, sizeof(header))) {
+    if (!CopyFromValueZone(value_zone_mrs, byte_offset, header, sizeof(header))) {
         return false;
     }
     const uint64_t total_size = DecodeFixed64(header);
@@ -65,7 +89,7 @@ bool TryExtractValueFromValueZone(const std::vector<ibv_mr*>& value_zone_mrs, ui
     }
 
     std::string record(static_cast<size_t>(total_size), '\0');
-    if (!copy_from_zone(byte_offset, record.data(), record.size())) {
+    if (!CopyFromValueZone(value_zone_mrs, byte_offset, record.data(), record.size())) {
         return false;
     }
     const char* base = record.data();
@@ -89,7 +113,45 @@ bool TryExtractValueFromValueZone(const std::vector<ibv_mr*>& value_zone_mrs, ui
     value->assign(base + 48 + padded_key_size, static_cast<size_t>(value_size));
     *sequence = DecodeFixed64(base + 16);
     *value_type = raw_type == 0 ? kTypeValue : kTypeDeletion;
+    if (previous_offset_units != nullptr) {
+        *previous_offset_units = DecodeFixed32(base + 48 + padded_key_size + padded_value_size + 4);
+    }
     return true;
+}
+
+// Link an unpublished value-zone record to the previous bucket head. The
+// caller publishes the new slot only after this function succeeds.
+bool PatchValueZonePreviousOffset(const std::vector<ibv_mr*>& value_zone_mrs,
+                                  uint64_t offset_units, uint64_t expected_key_index,
+                                  SequenceNumber expected_sequence, uint64_t previous_offset_units) {
+    if (previous_offset_units > std::numeric_limits<uint32_t>::max()) {
+        return false;
+    }
+    const uint64_t byte_offset = offset_units * VALUE_ZONE_OFFSET_UNIT;
+    char header[48];
+    if (!CopyFromValueZone(value_zone_mrs, byte_offset, header, sizeof(header)) ||
+        DecodeFixed64(header + 8) != expected_key_index ||
+        DecodeFixed64(header + 16) != expected_sequence) {
+        return false;
+    }
+    const uint64_t total_size = DecodeFixed64(header);
+    const uint64_t key_size = DecodeFixed64(header + 32);
+    const uint64_t value_size = DecodeFixed64(header + 40);
+    const size_t padded_key_size =
+        (static_cast<size_t>(key_size) + VALUE_ZONE_OFFSET_UNIT - 1) / VALUE_ZONE_OFFSET_UNIT *
+        VALUE_ZONE_OFFSET_UNIT;
+    const size_t padded_value_size =
+        (static_cast<size_t>(value_size) + VALUE_ZONE_OFFSET_UNIT - 1) / VALUE_ZONE_OFFSET_UNIT *
+        VALUE_ZONE_OFFSET_UNIT;
+    const size_t raw_total_size = 48 + padded_key_size + padded_value_size + 8;
+    if (total_size < raw_total_size || total_size - raw_total_size >= VALUE_ZONE_OFFSET_UNIT) {
+        return false;
+    }
+    char encoded_previous[sizeof(uint32_t)];
+    EncodeFixed32(encoded_previous, static_cast<uint32_t>(previous_offset_units));
+    const uint64_t previous_position = byte_offset + 48 + padded_key_size + padded_value_size + 4;
+    return CopyToValueZone(value_zone_mrs, previous_position, encoded_previous,
+                           sizeof(encoded_previous));
 }
 
 std::string BuildInternalKey(const std::string& user_key, SequenceNumber sequence, ValueType value_type) {
@@ -2397,7 +2459,12 @@ void Memory_Node_Keeper::flush_helper_handler(void* arg) {
     const char* ptr = static_cast<const char*>(updates_mr.addr);
     size_t error_count = 0;
     const size_t kMaxErrorLogs = 10;
-    std::lock_guard<std::mutex> update_lock(bucket_update_mu_);
+    std::vector<ibv_mr*> value_zone_mrs;
+    {
+        std::lock_guard<std::mutex> lock(value_zone_mr_mu_);
+        value_zone_mrs = value_zone_mrs_;
+    }
+    std::unique_lock<std::shared_mutex> update_lock(bucket_update_mu_);
     for (size_t i = 0; i < kv_count; ++i) {
         const uint64_t key_index = DecodeFixed64(ptr);
         const uint64_t offset_units = DecodeFixed64(ptr + sizeof(uint64_t));
@@ -2428,6 +2495,23 @@ void Memory_Node_Keeper::flush_helper_handler(void* arg) {
 
         auto sequence_it = latest_bucket_sequence_by_key_.find(key_index);
         if (sequence_it != latest_bucket_sequence_by_key_.end() && sequence < sequence_it->second) {
+            ptr += pair_size;
+            continue;
+        }
+
+        uint64_t previous_offset_units = 0;
+        Status read_status = builder->ReadSlot(slot_idx, &previous_offset_units);
+        if (!read_status.ok() ||
+            !PatchValueZonePreviousOffset(value_zone_mrs, offset_units, key_index, sequence,
+                                          previous_offset_units)) {
+            if (error_count < kMaxErrorLogs) {
+                std::fprintf(stderr,
+                             "flush_helper: failed to link MVCC version key=%llu seq=%llu prev=%llu\n",
+                             static_cast<unsigned long long>(key_index),
+                             static_cast<unsigned long long>(sequence),
+                             static_cast<unsigned long long>(previous_offset_units));
+            }
+            error_count++;
             ptr += pair_size;
             continue;
         }
@@ -2475,7 +2559,12 @@ void Memory_Node_Keeper::bucket_scan_handler(void* arg) {
         SequenceNumber sequence;
         ValueType value_type;
     };
+    struct ScanCandidate {
+        uint64_t key_index;
+        uint64_t head_offset_units;
+    };
     std::vector<ScanItem> items;
+    std::vector<ScanCandidate> candidates;
     uint64_t error_count = 0;
     std::vector<ibv_mr*> value_zone_mrs;
     {
@@ -2484,11 +2573,13 @@ void Memory_Node_Keeper::bucket_scan_handler(void* arg) {
     }
 
     if (scan.start_key < scan.end_key && scan.cursor_key < scan.end_key) {
-        std::lock_guard<std::mutex> update_lock(bucket_update_mu_);
+        // MVCC snapshot: only key discovery and bucket-head capture require
+        // metadata synchronization. Version records are immutable and are
+        // decoded after releasing this shared lock.
+        std::shared_lock<std::shared_mutex> update_lock(bucket_update_mu_);
         for (const auto& key_sequence : latest_bucket_sequence_by_key_) {
             const uint64_t key_index = key_sequence.first;
-            if (key_index < std::max(scan.start_key, scan.cursor_key) || key_index >= scan.end_key ||
-                key_sequence.second > scan.max_sequence) {
+            if (key_index < std::max(scan.start_key, scan.cursor_key) || key_index >= scan.end_key) {
                 continue;
             }
             const uint64_t bucket_idx = key_index / SLOT_NUM_PER_BUCKET;
@@ -2499,19 +2590,39 @@ void Memory_Node_Keeper::bucket_scan_handler(void* arg) {
                 ++error_count;
                 continue;
             }
+            candidates.push_back({key_index, offset_units});
+        }
+    }
 
+    for (const ScanCandidate& candidate : candidates) {
+        uint64_t offset_units = candidate.head_offset_units;
+        bool decoded = false;
+        for (size_t depth = 0; offset_units != 0 && depth < 1024; ++depth) {
             std::string key;
             std::string value;
             SequenceNumber sequence = 0;
             ValueType value_type = kTypeValue;
-            if (!TryExtractValueFromValueZone(value_zone_mrs, offset_units, key_index,
-                                              &key, &value, &sequence, &value_type)) {
+            uint64_t previous_offset_units = 0;
+            if (!TryExtractValueFromValueZone(value_zone_mrs, offset_units, candidate.key_index,
+                                              &key, &value, &sequence, &value_type,
+                                              &previous_offset_units)) {
                 ++error_count;
-                continue;
+                break;
             }
+            decoded = true;
             if (sequence <= scan.max_sequence) {
-                items.push_back({key_index, std::move(key), std::move(value), sequence, value_type});
+                items.push_back({candidate.key_index, std::move(key), std::move(value), sequence,
+                                 value_type});
+                break;
             }
+            if (previous_offset_units == offset_units) {
+                ++error_count;
+                break;
+            }
+            offset_units = previous_offset_units;
+        }
+        if (!decoded && candidate.head_offset_units != 0) {
+            continue;
         }
     }
 
@@ -2680,6 +2791,7 @@ Status Memory_Node_Keeper::hot_to_cold_worker(uint64_t shard_idx, uint64_t bucke
                                               uint8_t target_node_id) {
     struct KVItem {
         uint64_t key_index;
+        uint64_t head_offset_units;
         std::string key;
         std::string value;
         SequenceNumber sequence;
@@ -2692,27 +2804,43 @@ Status Memory_Node_Keeper::hot_to_cold_worker(uint64_t shard_idx, uint64_t bucke
         std::lock_guard<std::mutex> lock(value_zone_mr_mu_);
         value_zone_mrs = value_zone_mrs_;
     }
-    std::lock_guard<std::mutex> update_lock(bucket_update_mu_);
     auto builder = GetBucketTableBuilder(bucket_idx);
     if (builder) {
-        const uint64_t max_slots = builder->MaxSlots();
-        for (uint64_t slot_idx = 0; slot_idx < max_slots; ++slot_idx) {
-            uint64_t offset_units = 0;
-            Status read_status = builder->ReadSlot(slot_idx, &offset_units);
-            if (!read_status.ok() || offset_units == 0) {
-                continue;
+        struct SlotSnapshot {
+            uint64_t key_index;
+            uint64_t offset_units;
+        };
+        std::vector<SlotSnapshot> slot_snapshot;
+        {
+            std::shared_lock<std::shared_mutex> update_lock(bucket_update_mu_);
+            for (const auto& key_sequence : latest_bucket_sequence_by_key_) {
+                const uint64_t key_index = key_sequence.first;
+                if (key_index / SLOT_NUM_PER_BUCKET != bucket_idx) {
+                    continue;
+                }
+                const uint64_t slot_idx = key_index % SLOT_NUM_PER_BUCKET;
+                uint64_t offset_units = 0;
+                Status read_status = builder->ReadSlot(slot_idx, &offset_units);
+                if (read_status.ok() && offset_units != 0) {
+                    slot_snapshot.push_back({key_index, offset_units});
+                }
             }
+        }
 
-            const uint64_t key_index = bucket_idx * SLOT_NUM_PER_BUCKET + slot_idx;
+        for (const SlotSnapshot& snapshot : slot_snapshot) {
+            const uint64_t key_index = snapshot.key_index;
+            const uint64_t offset_units = snapshot.offset_units;
             std::string key;
             std::string value;
             SequenceNumber sequence = 0;
             ValueType value_type = kTypeValue;
             if (!TryExtractValueFromValueZone(value_zone_mrs, offset_units, key_index,
-                                              &key, &value, &sequence, &value_type)) {
+                                              &key, &value, &sequence, &value_type,
+                                              nullptr)) {
                 continue;
             }
-            kv_items.push_back({key_index, std::move(key), std::move(value), sequence, value_type});
+            kv_items.push_back({key_index, offset_units, std::move(key), std::move(value), sequence,
+                                value_type});
         }
     }
 
@@ -2782,11 +2910,21 @@ Status Memory_Node_Keeper::hot_to_cold_worker(uint64_t shard_idx, uint64_t bucke
 
     size_t cleared_slots = 0;
     if (builder) {
-        const uint64_t max_slots = builder->MaxSlots();
-        for (uint64_t slot_idx = 0; slot_idx < max_slots; ++slot_idx) {
+        std::unique_lock<std::shared_mutex> update_lock(bucket_update_mu_);
+        for (const KVItem& kv : kv_items) {
+            const uint64_t slot_idx = kv.key_index % SLOT_NUM_PER_BUCKET;
+            uint64_t current_offset_units = 0;
+            if (!builder->ReadSlot(slot_idx, &current_offset_units).ok() ||
+                current_offset_units != kv.head_offset_units) {
+                continue;
+            }
             Status clear_status = builder->UpdateSlot(slot_idx, 0);
             if (clear_status.ok()) {
-                latest_bucket_sequence_by_key_.erase(bucket_idx * SLOT_NUM_PER_BUCKET + slot_idx);
+                auto sequence_it = latest_bucket_sequence_by_key_.find(kv.key_index);
+                if (sequence_it != latest_bucket_sequence_by_key_.end() &&
+                    sequence_it->second == kv.sequence) {
+                    latest_bucket_sequence_by_key_.erase(sequence_it);
+                }
                 ++cleared_slots;
             }
         }

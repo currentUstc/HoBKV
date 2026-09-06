@@ -6,6 +6,7 @@
 #define TimberSaw_HOME_NODE_KEEPER_H
 
 #include <queue>
+#include <shared_mutex>
 #include <unordered_map>
 #include <mutex>
 // #include <fcntl.h>
@@ -222,7 +223,10 @@ private:
                                        uint8_t target_node_id);
 
     std::mutex bucket_table_mu_;
-    std::mutex bucket_update_mu_;
+    // Bucket slots and the latest-version index are published together.
+    // Scans take a short shared snapshot; flush/migration publishes with an
+    // exclusive lock. Value-zone records are immutable after publication.
+    std::shared_mutex bucket_update_mu_;
     std::mutex value_zone_mr_mu_;
     std::vector<ibv_mr*> value_zone_mrs_;
     std::unordered_map<uint64_t, std::shared_ptr<BucketTableBuilderMemorySide>> bucket_table_builders_;

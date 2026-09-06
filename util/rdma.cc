@@ -1088,6 +1088,8 @@ void RDMA_Manager::Client_Set_Up_Resources() {
 void RDMA_Manager::Initialize_threadlocal_map() {
     Remote_Mem_Bitmap.insert({FlushBuffer, new std::map<uint8_t, std::map<void*, In_Use_Array*>*>});
     Remote_Mem_Bitmap.insert({FilterChunk, new std::map<uint8_t, std::map<void*, In_Use_Array*>*>});
+    Remote_Mem_Bitmap.insert({BucketChunk, new std::map<uint8_t, std::map<void*, In_Use_Array*>*>});
+    Remote_Mem_Bitmap.insert({ValueZoneChunk, new std::map<uint8_t, std::map<void*, In_Use_Array*>*>});
     deallocation_buffers.insert({FlushBuffer, new std::map<uint8_t, uint64_t*>});
     deallocation_buffers.insert({FilterChunk, new std::map<uint8_t, uint64_t*>});
 
@@ -1114,6 +1116,8 @@ void RDMA_Manager::Initialize_threadlocal_map() {
         local_read_qp_info.insert({target_node_id, new ThreadLocalPtr(&General_Destroy<registered_qp_config*>)});
         Remote_Mem_Bitmap.at(FlushBuffer)->insert({target_node_id, new std::map<void*, In_Use_Array*>()});
         Remote_Mem_Bitmap.at(FilterChunk)->insert({target_node_id, new std::map<void*, In_Use_Array*>()});
+        Remote_Mem_Bitmap.at(BucketChunk)->insert({target_node_id, new std::map<void*, In_Use_Array*>()});
+        Remote_Mem_Bitmap.at(ValueZoneChunk)->insert({target_node_id, new std::map<void*, In_Use_Array*>()});
 
         deallocation_buffers.at(FlushBuffer)
             ->insert({target_node_id, new uint64_t[REMOTE_DEALLOC_BUFF_SIZE / sizeof(uint64_t)]});

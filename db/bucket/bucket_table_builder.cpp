@@ -141,10 +141,6 @@ Status BucketTableBuilder::Finish() {
 			asm volatile("lfence\n" : :);
 			asm volatile("mfence\n" : :);
 
-			// The flush RPC and ordinary bucket/value RDMA operations share the
-			// main QP send CQ, so its send completion and reply must stay ordered
-			// with those operations.
-			std::lock_guard<std::mutex> main_send_lock(rdma_mg_->main_send_cq_mutex);
 			rdma_mg_->post_send<RDMA_Request>(&send_mr, target_node_id_, std::string("main"));
 			ibv_wc wc[2] = {};
 			if (rdma_mg_->poll_completion(wc, 1, std::string("main"), true, target_node_id_)) {

@@ -5,6 +5,21 @@
 #include "TimberSaw/env.h"
 
 namespace TimberSaw {
+
+thread_local std::unordered_map<const RDMA_Manager*,
+    std::unordered_map<uint8_t, std::deque<uint64_t>>> RDMA_Manager::pending_main_send_wr_ids_;
+
+uint64_t RDMA_Manager::AllocateMainSendWrId() {
+    uint64_t wr_id = next_main_send_wr_id_.fetch_add(1, std::memory_order_relaxed);
+    if (wr_id == 0) {
+        wr_id = next_main_send_wr_id_.fetch_add(1, std::memory_order_relaxed);
+    }
+    return wr_id;
+}
+
+void RDMA_Manager::RecordMainSendWrId(uint8_t target_node_id, uint64_t wr_id) {
+    pending_main_send_wr_ids_[this][target_node_id].push_back(wr_id);
+}
 uint8_t RDMA_Manager::node_id = 1;
 #ifdef PROCESSANALYSIS
 std::atomic<uint64_t> RDMA_Manager::RDMAReadTimeElapseSum = 0;
@@ -1921,11 +1936,6 @@ End of socket operations
 // return 0 means success
 int RDMA_Manager::RDMA_Read(ibv_mr* remote_mr, ibv_mr* local_mr, size_t msg_size, std::string qp_type, size_t send_flag,
                             int poll_num, uint8_t target_node_id) {
-    std::unique_lock<std::mutex> main_send_lock(main_send_cq_mutex, std::defer_lock);
-    if (qp_type != "read_local" && qp_type != "write_local_flush" &&
-        qp_type != "write_local_compact") {
-        main_send_lock.lock();
-    }
     // #ifdef GETANALYSIS
     //   auto start = std::chrono::high_resolution_clock::now();
     // #endif
@@ -1942,7 +1952,10 @@ int RDMA_Manager::RDMA_Read(ibv_mr* remote_mr, ibv_mr* local_mr, size_t msg_size
     /* prepare the send work request */
     memset(&sr, 0, sizeof(sr));
     sr.next = NULL;
-    sr.wr_id = 0;
+    const bool shared_main_cq = UsesSharedMainCQ(qp_type);
+    const bool tracked_main_send = shared_main_cq && poll_num != 0;
+    const uint64_t wr_id = shared_main_cq ? AllocateMainSendWrId() : 0;
+    sr.wr_id = wr_id;
     sr.sg_list = &sge;
     sr.num_sge = 1;
     sr.opcode = IBV_WR_RDMA_READ;
@@ -1998,6 +2011,9 @@ int RDMA_Manager::RDMA_Read(ibv_mr* remote_mr, ibv_mr* local_mr, size_t msg_size
         exit(1);
 
     } else {
+        if (tracked_main_send) {
+            RecordMainSendWrId(target_node_id, wr_id);
+        }
         //      printf("qid: %s", q_id.c_str());
     }
     //  else
@@ -2036,11 +2052,6 @@ int RDMA_Manager::RDMA_Read(ibv_mr* remote_mr, ibv_mr* local_mr, size_t msg_size
 }
 int RDMA_Manager::RDMA_Write(ibv_mr* remote_mr, ibv_mr* local_mr, size_t msg_size, std::string qp_type,
                              size_t send_flag, int poll_num, uint8_t target_node_id) {
-    std::unique_lock<std::mutex> main_send_lock(main_send_cq_mutex, std::defer_lock);
-    if (qp_type != "read_local" && qp_type != "write_local_flush" &&
-        qp_type != "write_local_compact") {
-        main_send_lock.lock();
-    }
     //  auto start = std::chrono::high_resolution_clock::now();
     struct ibv_send_wr sr;
     struct ibv_sge sge;
@@ -2054,7 +2065,10 @@ int RDMA_Manager::RDMA_Write(ibv_mr* remote_mr, ibv_mr* local_mr, size_t msg_siz
     /* prepare the send work request */
     memset(&sr, 0, sizeof(sr));
     sr.next = NULL;
-    sr.wr_id = 0;
+    const bool shared_main_cq = UsesSharedMainCQ(qp_type);
+    const bool tracked_main_send = shared_main_cq && poll_num != 0;
+    const uint64_t wr_id = shared_main_cq ? AllocateMainSendWrId() : 0;
+    sr.wr_id = wr_id;
     sr.sg_list = &sge;
     sr.num_sge = 1;
     sr.opcode = IBV_WR_RDMA_WRITE;
@@ -2099,7 +2113,11 @@ int RDMA_Manager::RDMA_Write(ibv_mr* remote_mr, ibv_mr* local_mr, size_t msg_siz
     }
 
     //  start = std::chrono::high_resolution_clock::now();
-    if (rc) fprintf(stderr, "failed to post SR, return is %d\n", rc);
+    if (rc) {
+        fprintf(stderr, "failed to post SR, return is %d\n", rc);
+    } else if (tracked_main_send) {
+        RecordMainSendWrId(target_node_id, wr_id);
+    }
     //  else
     //  {
     //      fprintf(stdout, "RDMA Write Request was posted, OPCODE is %d\n", sr.opcode);
@@ -2109,7 +2127,7 @@ int RDMA_Manager::RDMA_Write(ibv_mr* remote_mr, ibv_mr* local_mr, size_t msg_siz
         //  auto start = std::chrono::high_resolution_clock::now();
         //  while(std::chrono::high_resolution_clock::now()-start < std::chrono::nanoseconds(msg_size+200000));
         // wait until the job complete.
-        rc = poll_completion(wc, poll_num, qp_type, true, 0);
+        rc = poll_completion(wc, poll_num, qp_type, true, target_node_id);
         if (rc != 0) {
             std::cout << "RDMA Write Failed" << std::endl;
             std::cout << "q id is" << qp_type << std::endl;
@@ -2125,11 +2143,6 @@ int RDMA_Manager::RDMA_Write(ibv_mr* remote_mr, ibv_mr* local_mr, size_t msg_siz
 }
 int RDMA_Manager::RDMA_Write(void* addr, uint32_t rkey, ibv_mr* local_mr, size_t msg_size, std::string qp_type,
                              size_t send_flag, int poll_num, uint8_t target_node_id) {
-    std::unique_lock<std::mutex> main_send_lock(main_send_cq_mutex, std::defer_lock);
-    if (qp_type != "read_local" && qp_type != "write_local_flush" &&
-        qp_type != "write_local_compact") {
-        main_send_lock.lock();
-    }
     //  auto start = std::chrono::high_resolution_clock::now();
     struct ibv_send_wr sr;
     struct ibv_sge sge;
@@ -2143,7 +2156,10 @@ int RDMA_Manager::RDMA_Write(void* addr, uint32_t rkey, ibv_mr* local_mr, size_t
     /* prepare the send work request */
     memset(&sr, 0, sizeof(sr));
     sr.next = NULL;
-    sr.wr_id = 0;
+    const bool shared_main_cq = UsesSharedMainCQ(qp_type);
+    const bool tracked_main_send = shared_main_cq && poll_num != 0;
+    const uint64_t wr_id = shared_main_cq ? AllocateMainSendWrId() : 0;
+    sr.wr_id = wr_id;
     sr.sg_list = &sge;
     sr.num_sge = 1;
     sr.opcode = IBV_WR_RDMA_WRITE;
@@ -2188,7 +2204,11 @@ int RDMA_Manager::RDMA_Write(void* addr, uint32_t rkey, ibv_mr* local_mr, size_t
     }
 
     //  start = std::chrono::high_resolution_clock::now();
-    if (rc) fprintf(stderr, "failed to post SR, return is %d\n", rc);
+    if (rc) {
+        fprintf(stderr, "failed to post SR, return is %d\n", rc);
+    } else if (tracked_main_send) {
+        RecordMainSendWrId(target_node_id, wr_id);
+    }
     //  else
     //  {
     //      fprintf(stdout, "RDMA Write Request was posted, OPCODE is %d\n", sr.opcode);
@@ -2230,7 +2250,10 @@ int RDMA_Manager::RDMA_Write_Imme(void* addr, uint32_t rkey, ibv_mr* local_mr, s
     /* prepare the send work request */
     memset(&sr, 0, sizeof(sr));
     sr.next = NULL;
-    sr.wr_id = 0;
+    const bool shared_main_cq = UsesSharedMainCQ(qp_type);
+    const bool tracked_main_send = shared_main_cq && poll_num != 0;
+    const uint64_t wr_id = shared_main_cq ? AllocateMainSendWrId() : 0;
+    sr.wr_id = wr_id;
     sr.sg_list = &sge;
     sr.num_sge = 1;
     sr.imm_data = imme;
@@ -2276,6 +2299,9 @@ int RDMA_Manager::RDMA_Write_Imme(void* addr, uint32_t rkey, ibv_mr* local_mr, s
         l.unlock();
     }
     assert(rc == 0);
+    if (rc == 0 && tracked_main_send) {
+        RecordMainSendWrId(target_node_id, wr_id);
+    }
     //  start = std::chrono::high_resolution_clock::now();
     if (rc) fprintf(stderr, "failed to post SR, return is %d\n", rc);
     //  else
@@ -2379,7 +2405,9 @@ int RDMA_Manager::post_send(ibv_mr* mr, std::string qp_type, size_t size, uint8_
     /* prepare the send work request */
     memset(&sr, 0, sizeof(sr));
     sr.next = NULL;
-    sr.wr_id = 0;
+    const bool shared_main_cq = UsesSharedMainCQ(qp_type);
+    const uint64_t wr_id = shared_main_cq ? AllocateMainSendWrId() : 0;
+    sr.wr_id = wr_id;
     sr.sg_list = &sge;
     sr.num_sge = 1;
     sr.opcode = static_cast<ibv_wr_opcode>(IBV_WR_SEND);
@@ -2422,6 +2450,9 @@ int RDMA_Manager::post_send(ibv_mr* mr, std::string qp_type, size_t size, uint8_
         rc = ibv_post_send(res->qp_map.at(target_node_id), &sr, &bad_wr);
         l.unlock();
     }
+    if (rc == 0 && shared_main_cq) {
+        RecordMainSendWrId(target_node_id, wr_id);
+    }
 #ifndef NDEBUG
     if (rc)
         fprintf(stderr, "failed to post SR\n");
@@ -2457,7 +2488,9 @@ int RDMA_Manager::post_send(ibv_mr** mr_list, size_t sge_size, std::string qp_ty
     /* prepare the send work request */
     memset(&sr, 0, sizeof(sr));
     sr.next = NULL;
-    sr.wr_id = 0;
+    const bool shared_main_cq = UsesSharedMainCQ(qp_type);
+    const uint64_t wr_id = shared_main_cq ? AllocateMainSendWrId() : 0;
+    sr.wr_id = wr_id;
     sr.sg_list = sge;
     sr.num_sge = sge_size;
     sr.opcode = static_cast<ibv_wr_opcode>(IBV_WR_SEND);
@@ -2499,6 +2532,9 @@ int RDMA_Manager::post_send(ibv_mr** mr_list, size_t sge_size, std::string qp_ty
         std::shared_lock<std::shared_mutex> l(qp_cq_map_mutex);
         rc = ibv_post_send(res->qp_map.at(target_node_id), &sr, &bad_wr);
         l.unlock();
+    }
+    if (rc == 0 && shared_main_cq) {
+        RecordMainSendWrId(target_node_id, wr_id);
     }
 #ifndef NDEBUG
     if (rc)
@@ -2702,6 +2738,9 @@ int RDMA_Manager::poll_completion(ibv_wc* wc_p, int num_entries, std::string qp_
         assert(cq != nullptr);
     }
     l.unlock();
+    if (send_cq && UsesSharedMainCQ(qp_type)) {
+        return PollMainSendCompletions(cq, wc_p, num_entries, target_node_id);
+    }
     do {
         poll_result = ibv_poll_cq(cq, num_entries, &wc_p[poll_num]);
         if (poll_result < 0)
@@ -2733,6 +2772,97 @@ int RDMA_Manager::poll_completion(ibv_wc* wc_p, int num_entries, std::string qp_
                 assert(false);
                 rc = 1;
             }
+        }
+    }
+    return rc;
+}
+
+int RDMA_Manager::PollMainSendCompletions(ibv_cq* cq, ibv_wc* wc_p, int num_entries,
+                                          uint8_t target_node_id) {
+    auto manager_it = pending_main_send_wr_ids_.find(this);
+    if (manager_it == pending_main_send_wr_ids_.end()) {
+        fprintf(stderr, "main send CQ poll has no request registered for this thread\n");
+        return 1;
+    }
+    auto target_it = manager_it->second.find(target_node_id);
+    if (target_it == manager_it->second.end() ||
+        target_it->second.size() < static_cast<size_t>(num_entries)) {
+        fprintf(stderr, "main send CQ poll expected %d request(s), but only %zu are registered\n",
+                num_entries,
+                target_it == manager_it->second.end() ? 0 : target_it->second.size());
+        return 1;
+    }
+
+    std::vector<uint64_t> expected;
+    expected.reserve(num_entries);
+    for (int i = 0; i < num_entries; ++i) {
+        expected.push_back(target_it->second.front());
+        target_it->second.pop_front();
+    }
+
+    MainSendCQState& state = main_send_cq_states_[target_node_id];
+    size_t completed_count = 0;
+    while (completed_count < expected.size()) {
+        {
+            std::lock_guard<std::mutex> completed_lock(state.completed_mutex);
+            for (size_t i = 0; i < expected.size(); ++i) {
+                if (expected[i] == 0) {
+                    continue;
+                }
+                auto completion = state.completed.find(expected[i]);
+                if (completion != state.completed.end()) {
+                    wc_p[i] = completion->second;
+                    state.completed.erase(completion);
+                    expected[i] = 0;
+                    ++completed_count;
+                }
+            }
+        }
+        if (completed_count == expected.size()) {
+            break;
+        }
+
+        std::unique_lock<std::mutex> poll_lock(state.poll_mutex, std::try_to_lock);
+        if (!poll_lock.owns_lock()) {
+            std::this_thread::yield();
+            continue;
+        }
+
+        ibv_wc completions[16] = {};
+        const int poll_result = ibv_poll_cq(cq, 16, completions);
+        if (poll_result < 0) {
+            fprintf(stderr, "poll main send CQ failed\n");
+            return 1;
+        }
+        if (poll_result == 0) {
+            poll_lock.unlock();
+            std::this_thread::yield();
+            continue;
+        }
+
+        std::lock_guard<std::mutex> completed_lock(state.completed_mutex);
+        for (int i = 0; i < poll_result; ++i) {
+            if (completions[i].wr_id == 0) {
+                fprintf(stderr, "main send CQ returned an untagged completion\n");
+                return 1;
+            }
+            const auto inserted = state.completed.emplace(completions[i].wr_id, completions[i]);
+            if (!inserted.second) {
+                fprintf(stderr, "main send CQ returned duplicate wr_id=%" PRIu64 "\n",
+                        completions[i].wr_id);
+                return 1;
+            }
+        }
+    }
+
+    int rc = 0;
+    for (int i = 0; i < num_entries; ++i) {
+        if (wc_p[i].status != IBV_WC_SUCCESS) {
+            fprintf(stderr,
+                    "number %d got bad completion for wr_id=%" PRIu64
+                    " with status: 0x%x, vendor syndrome: 0x%x\n",
+                    i, wc_p[i].wr_id, wc_p[i].status, wc_p[i].vendor_err);
+            rc = 1;
         }
     }
     return rc;
@@ -2835,10 +2965,6 @@ void RDMA_Manager::usage(const char* argv0) {
 }
 
 bool RDMA_Manager::Remote_Memory_Register(size_t size, uint8_t target_node_id, Chunk_type c_type) {
-    // Registration is also a request/reply exchange on the main QP. Without
-    // this lock it can consume (or lose) a completion belonging to a hot-write
-    // flush, a transition RPC, or a bucket read.
-    std::lock_guard<std::mutex> main_send_lock(main_send_cq_mutex);
     // register the memory block from the remote memory
 
     RDMA_Request* send_pointer;
@@ -2927,7 +3053,6 @@ bool RDMA_Manager::Print_Remote_CPU_RPC(uint8_t target_node_id) {
     return true;
 }
 bool RDMA_Manager::Remote_Query_Pair_Connection(std::string& qp_type, uint8_t target_node_id) {
-    std::lock_guard<std::mutex> main_send_lock(main_send_cq_mutex);
     ibv_qp* qp = create_qp(target_node_id, false, qp_type);
 
     union ibv_gid my_gid;

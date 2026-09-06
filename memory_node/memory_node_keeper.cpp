@@ -396,7 +396,6 @@ void Memory_Node_Keeper::RecomputeBucketMigrationMeta(BucketMigrationMeta* meta)
 
 void Memory_Node_Keeper::SendBucketMetaUpdateToCompute(const BucketMigrationMeta& meta, const std::string& client_ip,
                                                        uint8_t target_node_id) {
-    std::lock_guard<std::mutex> main_send_lock(rdma_mg->main_send_cq_mutex);
     ibv_mr send_mr = {};
     rdma_mg->Allocate_Local_RDMA_Slot(send_mr, Message);
     RDMA_Request* send_pointer = reinterpret_cast<RDMA_Request*>(send_mr.addr);
@@ -2177,15 +2176,12 @@ void Memory_Node_Keeper::create_cpu_util_heart_beater_sender() {
                 }
                 // #endif
 
-                {
-                    std::lock_guard<std::mutex> main_send_lock(rdma_mg->main_send_cq_mutex);
-                    rdma_mg->post_send<RDMA_Request>(&send_mr, iter.first, std::string("main"));
-                    ibv_wc wc[2] = {};
-                    if (rdma_mg->poll_completion(wc, 1, std::string("main"), true, iter.first)) {
-                        rdma_mg->Deallocate_Local_RDMA_Slot(send_mr.addr, Message);
-                        fprintf(stderr, "failed to poll CPU heartbeat send\n");
-                        return;
-                    }
+                rdma_mg->post_send<RDMA_Request>(&send_mr, iter.first, std::string("main"));
+                ibv_wc wc[2] = {};
+                if (rdma_mg->poll_completion(wc, 1, std::string("main"), true, iter.first)) {
+                    rdma_mg->Deallocate_Local_RDMA_Slot(send_mr.addr, Message);
+                    fprintf(stderr, "failed to poll CPU heartbeat send\n");
+                    return;
                 }
                 rdma_mg->Deallocate_Local_RDMA_Slot(send_mr.addr, Message);
             }
@@ -2670,6 +2666,7 @@ void Memory_Node_Keeper::bucket_scan_handler(void* arg) {
     rdma_mg->Allocate_Local_RDMA_Slot(send_mr, Message);
     RDMA_Reply* reply = reinterpret_cast<RDMA_Reply*>(send_mr.addr);
     *reply = {};
+    reply->request_id = request->request_id;
     reply->content.bucket_scan.buffer_size = output.size();
     reply->content.bucket_scan.entry_count = emitted;
     reply->content.bucket_scan.next_key = consumed < items.size() ? items[consumed].key_index : scan.end_key;

@@ -3,12 +3,14 @@
 
 #define REMOTE_DEALLOC_BUFF_SIZE (128 + 128) * sizeof(uint64_t)
 #include <algorithm>
+#include <array>
 #include <arpa/inet.h>
 #include <atomic>
 #include <byteswap.h>
 #include <cassert>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <endian.h>
 #include <infiniband/verbs.h>
 #include <inttypes.h>
@@ -27,6 +29,7 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <thread>
+#include <type_traits>
 #include <unistd.h>
 #include <unordered_map>
 #include <vector>
@@ -243,6 +246,7 @@ union RDMA_Reply_Content {
 };
 struct RDMA_Request {
     RDMA_Command_Type command;
+    uint64_t request_id;
     RDMA_Request_Content content;
     void* buffer;
     uint32_t rkey;
@@ -253,7 +257,7 @@ struct RDMA_Request {
 } __attribute__((packed));
 
 struct RDMA_Reply {
-    //  RDMA_Command_Type command;
+    uint64_t request_id;
     RDMA_Reply_Content content;
     void* buffer;
     uint32_t rkey;
@@ -513,10 +517,6 @@ public:
     std::shared_mutex remote_mem_mutex;
 
     std::shared_mutex rw_mutex;
-    // The main QP has one shared send CQ. Keep each post/completion exchange
-    // together so concurrent background handlers cannot consume each other's
-    // completion and leave one operation waiting forever.
-    std::mutex main_send_cq_mutex;
     //  std::shared_mutex main_qp_mutex;
     std::shared_mutex qp_cq_map_mutex;
     //  ThreadLocalPtr* t_local_1;
@@ -634,7 +634,12 @@ public:
         /* prepare the send work request */
         memset(&sr, 0, sizeof(sr));
         sr.next = NULL;
-        sr.wr_id = 0;
+        const bool shared_main_cq = UsesSharedMainCQ(qp_type);
+        const uint64_t wr_id = shared_main_cq ? AllocateMainSendWrId() : 0;
+        sr.wr_id = wr_id;
+        if constexpr (std::is_same<T, RDMA_Request>::value) {
+            reinterpret_cast<RDMA_Request*>(mr->addr)->request_id = wr_id;
+        }
         sr.sg_list = &sge;
         sr.num_sge = 1;
         sr.opcode = static_cast<ibv_wr_opcode>(IBV_WR_SEND);
@@ -677,6 +682,9 @@ public:
             rc = ibv_post_send(res->qp_map.at(target_node_id), &sr, &bad_wr);
             l.unlock();
         }
+        if (rc == 0 && shared_main_cq) {
+            RecordMainSendWrId(target_node_id, wr_id);
+        }
         //    if (rc)
         //      fprintf(stderr, "failed to post SR\n");
         //    else {
@@ -691,6 +699,29 @@ public:
     //  std::shared_mutex* fs_mutex_;
 
 private:
+    // All threads may poll the shared main send CQ. A short poll lock ensures
+    // only one ibv_poll_cq call runs at a time; completed WRs are then routed
+    // by wr_id to the thread that posted them.
+    struct MainSendCQState {
+        std::mutex poll_mutex;
+        std::mutex completed_mutex;
+        std::unordered_map<uint64_t, ibv_wc> completed;
+    };
+
+    static bool UsesSharedMainCQ(const std::string& qp_type) {
+        return qp_type != "read_local" && qp_type != "write_local_flush" &&
+               qp_type != "write_local_compact";
+    }
+    uint64_t AllocateMainSendWrId();
+    void RecordMainSendWrId(uint8_t target_node_id, uint64_t wr_id);
+    int PollMainSendCompletions(ibv_cq* cq, ibv_wc* wc_p, int num_entries,
+                                uint8_t target_node_id);
+
+    std::atomic<uint64_t> next_main_send_wr_id_{1};
+    std::array<MainSendCQState, 256> main_send_cq_states_;
+    static thread_local std::unordered_map<const RDMA_Manager*,
+        std::unordered_map<uint8_t, std::deque<uint64_t>>> pending_main_send_wr_ids_;
+
     config_t rdma_config;
     int client_sock_connect(const char* servername, int port);
 

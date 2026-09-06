@@ -4221,15 +4221,14 @@ Status DBImpl::ScanRangeWithBucketHelper(const ReadOptions& options, Iterator* i
         asm volatile("mfence\n" : :);
 
         Status request_status = Status::OK();
-        {
-            std::lock_guard<std::mutex> main_send_lock(rdma_mg->main_send_cq_mutex);
-            rdma_mg->post_send<RDMA_Request>(&send_mr, shard_target_node_id, std::string("main"));
-            ibv_wc wc[2] = {};
-            if (rdma_mg->poll_completion(wc, 1, std::string("main"), true, shard_target_node_id)) {
-                request_status = Status::IOError("ScanRangeWithBucketHelper: request send failed");
-            } else if (!rdma_mg->poll_reply_buffer(reply)) {
-                request_status = Status::IOError("ScanRangeWithBucketHelper: reply timeout");
-            }
+        rdma_mg->post_send<RDMA_Request>(&send_mr, shard_target_node_id, std::string("main"));
+        ibv_wc wc[2] = {};
+        if (rdma_mg->poll_completion(wc, 1, std::string("main"), true, shard_target_node_id)) {
+            request_status = Status::IOError("ScanRangeWithBucketHelper: request send failed");
+        } else if (!rdma_mg->poll_reply_buffer(reply)) {
+            request_status = Status::IOError("ScanRangeWithBucketHelper: reply timeout");
+        } else if (reply->request_id != request->request_id) {
+            request_status = Status::Corruption("ScanRangeWithBucketHelper: reply request id mismatch");
         }
 
         *bucket_error_count += reply->content.bucket_scan.error_count;
@@ -4629,7 +4628,6 @@ Status DBImpl::Hot2Cold(size_t shard_idx) {
     asm volatile("lfence\n" : :);
     asm volatile("mfence\n" : :);
 
-    std::lock_guard<std::mutex> main_send_lock(rdma_mg->main_send_cq_mutex);
     rdma_mg->post_send<RDMA_Request>(&send_mr, shard_target_node_id, std::string("main"));
     ibv_wc wc[2] = {};
     if (rdma_mg->poll_completion(wc, 1, std::string("main"), true, shard_target_node_id)) {
@@ -4715,7 +4713,6 @@ Status DBImpl::Cold2Hot(size_t shard_idx) {
     asm volatile("lfence\n" : :);
     asm volatile("mfence\n" : :);
 
-    std::unique_lock<std::mutex> main_send_lock(rdma_mg->main_send_cq_mutex);
     rdma_mg->post_send<RDMA_Request>(&send_mr, shard_target_node_id, std::string("main"));
     ibv_wc wc[2] = {};
     if (rdma_mg->poll_completion(wc, 1, std::string("main"), true, shard_target_node_id)) {
@@ -4736,7 +4733,6 @@ Status DBImpl::Cold2Hot(size_t shard_idx) {
         rdma_mg->Deallocate_Local_RDMA_Slot(receive_mr.addr, Message);
         return Status::IOError("Cold2Hot: memory-side transition failed");
     }
-    main_send_lock.unlock();
 
     if (value_zone_ == nullptr) {
         value_zone_ = std::make_shared<ValueZone>(nullptr, VALUE_ZONE_MAX_SIZE, rdma_mg);

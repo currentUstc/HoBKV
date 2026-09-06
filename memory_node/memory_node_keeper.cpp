@@ -33,7 +33,7 @@ bool TryExtractValueFromMR(const ibv_mr* mr, uint64_t offset_units, uint64_t exp
         sequence == nullptr || value_type == nullptr) {
         return false;
     }
-    const uint64_t byte_offset = (offset_units * 8) % VALUE_ZONE_ALLOC_SIZE;
+    const uint64_t byte_offset = (offset_units * VALUE_ZONE_OFFSET_UNIT) % VALUE_ZONE_ALLOC_SIZE;
     if (byte_offset + 48 > mr->length) {
         return false;
     }
@@ -55,8 +55,12 @@ bool TryExtractValueFromMR(const ibv_mr* mr, uint64_t offset_units, uint64_t exp
     const uint64_t raw_type = DecodeFixed64(base + 24);
     const uint64_t key_size = DecodeFixed64(base + 32);
     const uint64_t value_size = DecodeFixed64(base + 40);
-    const size_t padded_key_size = (static_cast<size_t>(key_size) + 7) / 8 * 8;
-    const size_t padded_value_size = (static_cast<size_t>(value_size) + 7) / 8 * 8;
+    const size_t padded_key_size =
+        (static_cast<size_t>(key_size) + VALUE_ZONE_OFFSET_UNIT - 1) / VALUE_ZONE_OFFSET_UNIT *
+        VALUE_ZONE_OFFSET_UNIT;
+    const size_t padded_value_size =
+        (static_cast<size_t>(value_size) + VALUE_ZONE_OFFSET_UNIT - 1) / VALUE_ZONE_OFFSET_UNIT *
+        VALUE_ZONE_OFFSET_UNIT;
     if (48 + padded_key_size + padded_value_size + 8 != total_size) {
         return false;
     }

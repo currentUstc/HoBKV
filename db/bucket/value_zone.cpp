@@ -8,7 +8,7 @@
 namespace TimberSaw {
 
 namespace {
-constexpr size_t kValueZoneAlignment = 8;
+constexpr size_t kValueZoneAlignment = VALUE_ZONE_OFFSET_UNIT;
 
 size_t AlignUp(size_t value, size_t alignment) {
     return (value + alignment - 1) / alignment * alignment;
@@ -27,8 +27,9 @@ Status AppendValueZoneEntry(const Slice& key, const Slice& value, uint64_t seque
 
     const size_t padded_key_size = AlignUp(key.size(), kValueZoneAlignment);
     const size_t padded_value_size = AlignUp(value.size(), kValueZoneAlignment);
-    const uint64_t total_size = static_cast<uint64_t>(
-        6 * sizeof(uint64_t) + padded_key_size + padded_value_size + sizeof(uint64_t));
+    const size_t raw_total_size =
+        6 * sizeof(uint64_t) + padded_key_size + padded_value_size + sizeof(uint64_t);
+    const uint64_t total_size = static_cast<uint64_t>(AlignUp(raw_total_size, kValueZoneAlignment));
 
     PutFixed64(destination, total_size);
     PutFixed64(destination, key_index);
@@ -42,6 +43,7 @@ Status AppendValueZoneEntry(const Slice& key, const Slice& value, uint64_t seque
     destination->append(padded_value_size - value.size(), '\0');
     PutFixed32(destination, 0);  // next
     PutFixed32(destination, 0);  // prev
+    destination->append(total_size - raw_total_size, '\0');
 
     if (key_index_out != nullptr) {
         *key_index_out = key_index;
@@ -51,8 +53,8 @@ Status AppendValueZoneEntry(const Slice& key, const Slice& value, uint64_t seque
 
 ValueZone::ValueZone(char* data, size_t max_size, std::shared_ptr<RDMA_Manager> rdma_mg)
     : max_size_(max_size > 16 ? max_size - 16 : 0),
-      head(8),
-      tail(8),
+      head(VALUE_ZONE_OFFSET_UNIT),
+      tail(VALUE_ZONE_OFFSET_UNIT),
       rdma_mg_(rdma_mg) {
     assert(max_size_ > 0);
 }
@@ -124,7 +126,7 @@ Status ValueZone::BatchedPut(const std::string& batch, uint64_t* base_offset_uni
 
     const uint64_t base_offset_bytes = head;
     if (base_offset_units != nullptr) {
-        *base_offset_units = base_offset_bytes / 8;
+        *base_offset_units = base_offset_bytes / VALUE_ZONE_OFFSET_UNIT;
     }
 
     size_t remaining = batch.size();
@@ -173,14 +175,13 @@ Status ValueZone::Get(uint64_t offset, Slice& value) {
 Status ValueZone::GetWithSequence(uint64_t offset, Slice& value, uint64_t* sequence_number,
                                   bool* is_deletion) {
     std::lock_guard<std::mutex> lock(mutex_);
-    // offset 以 8B 为单位，且 >= 1
-    // offset=1 表示读取位置 8B
+    // offset uses VALUE_ZONE_OFFSET_UNIT-byte units and must be >= 1.
     if (offset < 1) {
         return Status::InvalidArgument("ValueZone: offset must be >= 1");
     }
     
     // 转换为字节偏移量
-    uint64_t byte_offset = offset * 8;
+    uint64_t byte_offset = offset * VALUE_ZONE_OFFSET_UNIT;
     
     // 第一步：定位 MR 和计算相对偏移
     size_t mr_index = byte_offset / VALUE_ZONE_ALLOC_SIZE;

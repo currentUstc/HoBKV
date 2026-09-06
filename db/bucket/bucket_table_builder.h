@@ -48,7 +48,7 @@ public:
     uint64_t value_zone_base_offset_units() const { return value_zone_base_offset_units_; }
 
 private:
-    static constexpr size_t kAlignBytes = 8;
+    static constexpr size_t kAlignBytes = VALUE_ZONE_OFFSET_UNIT;
     static constexpr size_t kUpdatePairBytes = sizeof(uint64_t) * 4;
 
     struct PendingEntry {

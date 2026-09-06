@@ -51,7 +51,8 @@ TEST(ValueZoneEntryTest, PreservesKeyValueSequenceAndDeletionType) {
     EXPECT_EQ(key.size(), DecodeFixed64(encoded.data() + 32));
     EXPECT_EQ(value.size(), DecodeFixed64(encoded.data() + 40));
     EXPECT_EQ(key, encoded.substr(48, key.size()));
-    const size_t padded_key_size = (key.size() + 7) / 8 * 8;
+    const size_t padded_key_size =
+        (key.size() + VALUE_ZONE_OFFSET_UNIT - 1) / VALUE_ZONE_OFFSET_UNIT * VALUE_ZONE_OFFSET_UNIT;
     EXPECT_EQ(value, encoded.substr(48 + padded_key_size, value.size()));
 }
 

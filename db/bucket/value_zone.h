@@ -22,7 +22,7 @@ Status AppendValueZoneEntry(const Slice& key, const Slice& value, uint64_t seque
 /*  
     Value Zone for storing values.
         Values are stored in a contiguous memory region.
-    Entry format (每个字段8B对齐):
+    Entry format (每条记录按 VALUE_ZONE_OFFSET_UNIT 对齐):
         [total_size, key_index, sequence_number, value_type, key_size, value_size,
          key_data, value_data, next(4B) + prev(4B)]
         原始 key 会被保留，以便热转冷时重建完全相同的 SST key。

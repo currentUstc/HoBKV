@@ -36,8 +36,9 @@ class Snapshot;
 #define SLOT_NUM_PER_BUCKET (BUCKET_SIZE / SLOT_SIZE)
 
 // value zone parameters
-#define VALUE_ZONE_MAX_SIZE (16 * 1024 * 1024 * 1024ULL)  // 16GB
+#define VALUE_ZONE_MAX_SIZE (64 * 1024 * 1024 * 1024ULL)  // 64GB
 #define VALUE_ZONE_ALLOC_SIZE (1 * 1024 * 1024 * 1024ULL)  // 1GB
+#define VALUE_ZONE_OFFSET_UNIT 16ULL
 
 // static size_t RDMA_WRITE_BLOCK = 1*1024*1024;
 //  DB contents are stored in a set of blocks, each of which holds a

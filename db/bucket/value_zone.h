@@ -7,6 +7,7 @@
 #include <util/rdma.h>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <vector>
 #include <cstdint>
@@ -87,7 +88,7 @@ private:
     uint64_t tail;
     std::shared_ptr<RDMA_Manager> rdma_mg_;   // RDMA 管理器
     std::vector<ibv_mr> value_zone_mr_list_;                    // RDMA 内存注册
-    mutable std::mutex mutex_;
+    mutable std::shared_mutex mutex_;
 };
 
 }

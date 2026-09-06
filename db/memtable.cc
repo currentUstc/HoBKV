@@ -28,7 +28,9 @@ std::atomic<uint64_t> MemTable::foundNum = 0;
 //}
 std::atomic_int64_t Memtable_created = 0;
 std::atomic_int64_t Memtable_deallocated = 0;
-MemTable::MemTable(const InternalKeyComparator& cmp) : comparator(cmp), refs_(0), table_(comparator, &arena_) {
+MemTable::MemTable(const InternalKeyComparator& cmp, uint64_t sequence_capacity)
+    : comparator(cmp), sequence_capacity_(sequence_capacity), refs_(0), table_(comparator, &arena_) {
+    assert(sequence_capacity_ > 0);
     // #ifndef NDEBUG
     //   printf("Memtable %p  get created, total created %lu\n", this, Memtable_created.fetch_add(1));
     // #endif
@@ -101,6 +103,7 @@ Iterator* MemTable::NewIterator() {
 }
 
 void MemTable::Add(SequenceNumber s, ValueType type, const Slice& key, const Slice& value) {
+    std::lock_guard<std::mutex> write_lock(table_write_mutex_);
     // Format of an entry is concatenation of:
     //  key_size     : varint32 of internal_key.size()
     //  key bytes    : char[internal_key.size()]

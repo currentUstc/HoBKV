@@ -104,7 +104,6 @@ Status ValueZone::Put(const Slice& key, const Slice& value, uint64_t sequence_nu
 }
 
 Status ValueZone::BatchedPut(const std::string& batch, uint64_t* base_offset_units) {
-    std::lock_guard<std::mutex> lock(mutex_);
     if (batch.empty()) {
         return Status::OK();
     }
@@ -113,20 +112,30 @@ Status ValueZone::BatchedPut(const std::string& batch, uint64_t* base_offset_uni
     }
 
     const size_t required_size = batch.size();
-    if (!HasSpace(required_size)) {
-        return Status::IOError("ValueZone: not enough space for batched put");
-    }
-
-    while (NeedAllocSpace(required_size)) {
-        Status s = AllocSpace();
-        if (!s.ok()) {
-            return s;
+    uint64_t write_head = 0;
+    std::vector<ibv_mr> remote_mrs;
+    {
+        // Reserve a disjoint append range and snapshot the MR descriptors.
+        // Published bucket offsets are installed only after BatchedPut returns,
+        // so readers cannot observe this range while its RDMA writes are in flight.
+        std::unique_lock<std::shared_mutex> lock(mutex_);
+        if (!HasSpace(required_size)) {
+            return Status::IOError("ValueZone: not enough space for batched put");
         }
-    }
 
-    const uint64_t base_offset_bytes = head;
-    if (base_offset_units != nullptr) {
-        *base_offset_units = base_offset_bytes / VALUE_ZONE_OFFSET_UNIT;
+        while (NeedAllocSpace(required_size)) {
+            Status s = AllocSpace();
+            if (!s.ok()) {
+                return s;
+            }
+        }
+
+        write_head = head;
+        head += required_size;
+        remote_mrs = value_zone_mr_list_;
+        if (base_offset_units != nullptr) {
+            *base_offset_units = write_head / VALUE_ZONE_OFFSET_UNIT;
+        }
     }
 
     size_t remaining = batch.size();
@@ -136,9 +145,9 @@ Status ValueZone::BatchedPut(const std::string& batch, uint64_t* base_offset_uni
     const size_t local_capacity = local_mr.length;
 
     while (remaining > 0) {
-        const size_t mr_index = head / VALUE_ZONE_ALLOC_SIZE;
-        const size_t offset_in_mr = head % VALUE_ZONE_ALLOC_SIZE;
-        if (mr_index >= value_zone_mr_list_.size()) {
+        const size_t mr_index = write_head / VALUE_ZONE_ALLOC_SIZE;
+        const size_t offset_in_mr = write_head % VALUE_ZONE_ALLOC_SIZE;
+        if (mr_index >= remote_mrs.size()) {
             rdma_mg_->Deallocate_Local_RDMA_Slot(local_mr.addr, FlushBuffer);
             return Status::IOError("ValueZone: write exceeds allocated memory");
         }
@@ -149,7 +158,7 @@ Status ValueZone::BatchedPut(const std::string& batch, uint64_t* base_offset_uni
         // TODO: 在 BucketTableBuilder 中直接构造 mr ，减少 memcpy 的数量。
         std::memcpy(local_mr.addr, src, chunk_len);
 
-        ibv_mr remote_mr = value_zone_mr_list_[mr_index];
+        ibv_mr remote_mr = remote_mrs[mr_index];
         remote_mr.addr = static_cast<void*>(static_cast<char*>(remote_mr.addr) + offset_in_mr);
 
         int ret = rdma_mg_->RDMA_Write(&remote_mr, &local_mr, chunk_len,
@@ -159,7 +168,7 @@ Status ValueZone::BatchedPut(const std::string& batch, uint64_t* base_offset_uni
             return Status::IOError("ValueZone: RDMA Write failed");
         }
 
-        head += chunk_len;
+        write_head += chunk_len;
         src += chunk_len;
         remaining -= chunk_len;
     }
@@ -174,7 +183,6 @@ Status ValueZone::Get(uint64_t offset, Slice& value) {
 
 Status ValueZone::GetWithSequence(uint64_t offset, Slice& value, uint64_t* sequence_number,
                                   bool* is_deletion) {
-    std::lock_guard<std::mutex> lock(mutex_);
     // offset uses VALUE_ZONE_OFFSET_UNIT-byte units and must be >= 1.
     if (offset < 1) {
         return Status::InvalidArgument("ValueZone: offset must be >= 1");
@@ -186,13 +194,22 @@ Status ValueZone::GetWithSequence(uint64_t offset, Slice& value, uint64_t* seque
     // 第一步：定位 MR 和计算相对偏移
     size_t mr_index = byte_offset / VALUE_ZONE_ALLOC_SIZE;
     size_t offset_in_mr = byte_offset % VALUE_ZONE_ALLOC_SIZE;
-    
-    if (mr_index >= value_zone_mr_list_.size()) {
+
+    auto snapshot_remote_mr = [this](size_t index, ibv_mr* result) {
+        std::shared_lock<std::shared_mutex> lock(mutex_);
+        if (index >= value_zone_mr_list_.size()) {
+            return false;
+        }
+        *result = value_zone_mr_list_[index];
+        return true;
+    };
+
+    ibv_mr remote_mr;
+    if (!snapshot_remote_mr(mr_index, &remote_mr)) {
         return Status::IOError("ValueZone: offset exceeds allocated memory");
     }
-    
+
     // 第二步：第一次 RDMA Read - 读取 total_size (8B)
-    ibv_mr remote_mr = value_zone_mr_list_[mr_index];
     remote_mr.addr = static_cast<void*>(static_cast<char*>(remote_mr.addr) + offset_in_mr);
     
     // 获取本地读取缓冲区
@@ -200,7 +217,7 @@ Status ValueZone::GetWithSequence(uint64_t offset, Slice& value, uint64_t* seque
     
     // 读取 total_size (8B)
     int ret = rdma_mg_->RDMA_Read(&remote_mr, local_mr, 8,
-                                  "default", IBV_SEND_SIGNALED, 1, 0);
+                                  "read_local", IBV_SEND_SIGNALED, 1, 0);
     if (ret != 0) {
         return Status::IOError("ValueZone: First RDMA Read failed (total_size)");
     }
@@ -223,7 +240,7 @@ Status ValueZone::GetWithSequence(uint64_t offset, Slice& value, uint64_t* seque
     if (offset_in_mr >= VALUE_ZONE_ALLOC_SIZE) {
         mr_index++;
         offset_in_mr = 0;
-        if (mr_index >= value_zone_mr_list_.size()) {
+        if (!snapshot_remote_mr(mr_index, &remote_mr)) {
             return Status::IOError("ValueZone: data spans beyond allocated memory");
         }
     }
@@ -234,21 +251,25 @@ Status ValueZone::GetWithSequence(uint64_t offset, Slice& value, uint64_t* seque
     // 处理跨 MR 边界的情况
     size_t bytes_read = 0;
     while (bytes_read < data_to_read) {
-        if (mr_index >= value_zone_mr_list_.size()) {
+        if (!snapshot_remote_mr(mr_index, &remote_mr)) {
             delete[] data_buffer;
             return Status::IOError("ValueZone: data spans beyond allocated memory");
         }
         
         // 计算本次读取大小
         size_t bytes_remaining_in_mr = VALUE_ZONE_ALLOC_SIZE - offset_in_mr;
-        size_t bytes_to_read_now = std::min(bytes_remaining_in_mr, data_to_read - bytes_read);
+        size_t bytes_to_read_now =
+            std::min({bytes_remaining_in_mr, data_to_read - bytes_read, static_cast<size_t>(local_mr->length)});
+        if (bytes_to_read_now == 0) {
+            delete[] data_buffer;
+            return Status::IOError("ValueZone: local RDMA read buffer has zero length");
+        }
         
         // 执行 RDMA Read
-        remote_mr = value_zone_mr_list_[mr_index];
         remote_mr.addr = static_cast<void*>(static_cast<char*>(remote_mr.addr) + offset_in_mr);
         
         ret = rdma_mg_->RDMA_Read(&remote_mr, local_mr, bytes_to_read_now,
-                                  "default", IBV_SEND_SIGNALED, 1, 0);
+                                  "read_local", IBV_SEND_SIGNALED, 1, 0);
         if (ret != 0) {
             delete[] data_buffer;
             return Status::IOError("ValueZone: Second RDMA Read failed");
@@ -258,9 +279,11 @@ Status ValueZone::GetWithSequence(uint64_t offset, Slice& value, uint64_t* seque
         memcpy(data_buffer + bytes_read, local_mr->addr, bytes_to_read_now);
         bytes_read += bytes_to_read_now;
         
-        // 移动到下一个 MR
-        mr_index++;
-        offset_in_mr = 0;
+        offset_in_mr += bytes_to_read_now;
+        if (offset_in_mr == VALUE_ZONE_ALLOC_SIZE) {
+            mr_index++;
+            offset_in_mr = 0;
+        }
     }
     
     // data_buffer starts immediately after total_size.

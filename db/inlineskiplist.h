@@ -655,6 +655,7 @@ bool InlineSkipList<Comparator>::InsertConcurrently(const char* key) {
     Node* prev[kMaxPossibleHeight];
     Node* next[kMaxPossibleHeight];
     Splice splice;
+    splice.height_ = 0;
     splice.prev_ = prev;
     splice.next_ = next;
     return Insert<true>(key, &splice, false);

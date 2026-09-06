@@ -84,11 +84,7 @@ private:
     autovector<MemTable*> to_delete;
 };
 // The structure for storing argument for thread pool.
-#ifdef WITHPERSISTENCE
-class DBImpl : public DB, RPC_Process {
-#else
-class DBImpl : public DB {
-#endif
+class DBImpl : public DB, public RPC_Process {
 public:
     DBImpl(const Options& options, const std::string& dbname, const unsigned long long max_key_range);
     DBImpl(const Options& raw_options, const std::string& dbname, const std::string ub, const std::string lb);
@@ -154,6 +150,7 @@ public:
     // long double server_cpu_percent = 0.0;
     //  void Wait_for_client_message_hanlding_setup();
     bool IsHotKey(const Slice& user_key);
+    void RecordWriteAccess(const Slice& user_key);
     std::shared_ptr<ValueZone> GetValueZone() const { return value_zone_; }
     std::shared_ptr<RDMA_Manager> GetRDMA_Manager() const { return env_ ? env_->rdma_mg : nullptr; }
     uint8_t GetShardTargetNodeId() const { return shard_target_node_id; }
@@ -240,13 +237,11 @@ private:
     void sync_option_to_remote(uint8_t target_node_id);
     void remote_qp_reset(std::string& qp_type, uint8_t target_node_id);
     void install_version_edit_handler(RDMA_Request* request, std::string client_ip);
-    void bucket_meta_update_handler(RDMA_Request* request);
+    void bucket_meta_update_handler(void* request) override;
     bool ShouldReadSSTForKey(const Slice& user_key, size_t shard_idx, SequenceNumber* cutover_sequence);
     bool TryGetValueFromBucket(size_t shard_idx, const Slice& user_key, std::string* value, SequenceNumber* seq,
                                bool* is_deletion, Status* status);
     bool GetShardIndexForKey(const Slice& key, size_t* shard_idx) const;
-    Status ApplyHotWrite(const Slice& key, const Slice& value, SequenceNumber sequence, bool is_deletion);
-    void DisableBucketOnlyReads(size_t shard_idx);
 
     
     void RecordKeyAccess(const Slice& key, bool is_write);
@@ -265,7 +260,7 @@ private:
 
 #ifdef WITHPERSISTENCE
     static void SSTable_Unpin_Dispatch(void* thread_args);
-    void persistence_unpin_handler(void* arg);
+    void persistence_unpin_handler(void* arg) override;
 #endif
     // Constant after construction
     Env* const env_;
@@ -281,6 +276,7 @@ private:
     const InternalKeyComparator internal_comparator_;
     const InternalFilterPolicy internal_filter_policy_;
     Options options_;  // options_.comparator == &internal_comparator_
+    const uint64_t memtable_sequence_size_;
     const bool owns_info_log_;
     const bool owns_cache_;
     const std::string dbname_;
@@ -361,7 +357,7 @@ private:
     long int accumulated_time = 0;
 
     struct ShardConfig {
-        size_t max_bucket_tables = 16;  // Maximum number of bucket tables allowed per shard
+        size_t max_bucket_tables = 3;  // Keep only the three dominant MixGraph hot regions active.
         // One key-range shard maps exactly to one bucket table.
         size_t KV_shards = BUCKET_NUMBER;
     };
@@ -377,7 +373,7 @@ private:
     uint64_t last_hotness_check_time_ = 0;                 // 上次热度检查时间（微秒）
     
     struct HotnessConfig {
-        uint64_t check_interval_us = 10000000;  // 检查间隔：10秒
+        uint64_t check_interval_us = 1000000;  // 检查间隔：1秒
         uint64_t hot_threshold = 1000;           // 热度阈值：访问次数
         double decay_factor = 0.9;               // 衰减因子
         double read_weight = 1.0;                // 读访问权重

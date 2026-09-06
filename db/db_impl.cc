@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <fstream>
 #include <list>
+#include <limits>
 #include <numa.h>
 #include <set>
 #include <string>
@@ -155,6 +156,9 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname, const unsi
       internal_comparator_(raw_options.comparator),
       internal_filter_policy_(raw_options.filter_policy),
       options_(SanitizeOptions(dbname, &internal_comparator_, &internal_filter_policy_, raw_options)),
+      memtable_sequence_size_(options_.memtable_max_entries == 0
+                                  ? MEMTABLE_SEQ_SIZE
+                                  : std::max<size_t>(1, options_.memtable_max_entries)),
       owns_info_log_(options_.info_log != raw_options.info_log),
       owns_cache_(options_.block_cache != raw_options.block_cache),
       dbname_(dbname),
@@ -188,9 +192,11 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname, const unsi
 #endif
 {
     printf("DBImpl start\n");
-#ifdef WITHPERSISTENCE
+    if (!options_.enable_hot_cold) {
+        hotness_config_.hot_threshold = std::numeric_limits<uint64_t>::max();
+        printf("Hot/cold bucket migration disabled: SST-only baseline\n");
+    }
     env_->rdma_mg->Set_DB_handler(this);
-#endif
 
     //  for(auto iter : options_.ShardInfo){
     //    versions_pool.insert({iter.first,
@@ -310,6 +316,9 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname, const std:
       internal_comparator_(raw_options.comparator),
       internal_filter_policy_(raw_options.filter_policy),
       options_(SanitizeOptions(dbname, &internal_comparator_, &internal_filter_policy_, raw_options)),
+      memtable_sequence_size_(options_.memtable_max_entries == 0
+                                  ? MEMTABLE_SEQ_SIZE
+                                  : std::max<size_t>(1, options_.memtable_max_entries)),
       owns_info_log_(options_.info_log != raw_options.info_log),
       owns_cache_(options_.block_cache != raw_options.block_cache),
       dbname_(dbname),
@@ -449,14 +458,14 @@ void DBImpl::WaitforAllbgtasks(bool clear_mem) {
         iter->SeekToFirst();
         if (iter->Valid()) {
             mem->NotFullTableflush();
-            MemTable* temp_mem = new MemTable(internal_comparator_);
+            MemTable* temp_mem = new MemTable(internal_comparator_, memtable_sequence_size_);
             DEBUG_arg("Not full flushed table first seq number is %lu", mem->GetFirstseq());
             // Get the real largest seq because it is not a full table flush
             uint64_t last_mem_seq = mem->Getlargest_seq();
             temp_mem->SetFirstSeq(last_mem_seq + 1);
             // starting from this sequenctial number, the data should write to the new memtable
             // set the immutable as seq_num - 1
-            temp_mem->SetLargestSeq(last_mem_seq + MEMTABLE_SEQ_SIZE);
+            temp_mem->SetLargestSeq(last_mem_seq + memtable_sequence_size_);
             temp_mem->Ref();
             mem->SetFlushState(MemTable::FLUSH_REQUESTED);
             mem_.store(temp_mem);
@@ -754,7 +763,7 @@ Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log, bool* save_man
         WriteBatchInternal::SetContents(&batch, record);
 
         if (mem == nullptr) {
-            mem = new MemTable(internal_comparator_);
+            mem = new MemTable(internal_comparator_, memtable_sequence_size_);
             mem->Ref();
         }
         status = WriteBatchInternal::InsertInto(&batch, mem);
@@ -798,7 +807,7 @@ Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log, bool* save_man
                 mem = nullptr;
             } else {
                 // mem can be nullptr if lognum exists but was empty.
-                mem_.store(new MemTable(internal_comparator_));
+                mem_.store(new MemTable(internal_comparator_, memtable_sequence_size_));
                 mem_.load()->Ref();
             }
         }
@@ -1060,7 +1069,15 @@ void DBImpl::CompactMemTable() {
     //  base->Unref();
     //  assert(edit.GetNewFilesNum()==1);
 
-    TryInstallMemtableFlushResults(&f_job, versions_, f_job.sst, &edit);
+    if (s.ok()) {
+        s = TryInstallMemtableFlushResults(&f_job, versions_, f_job.sst, &edit);
+    } else {
+        std::unique_lock<std::mutex> rollback_lock(FlushPickMTX);
+        imm_.RollbackMemtableFlush(f_job.mem_vec, f_job.sst != nullptr ? f_job.sst->number : 0);
+    }
+    if (!s.ok()) {
+        RecordBackgroundError(s);
+    }
     //  MaybeScheduleFlushOrCompaction();
     // The index checking below is supposed to be deleted.
     //  if (s.ok()) {
@@ -1129,7 +1146,15 @@ void DBImpl::ForceCompactMemTable() {
     //  base->Unref();
     //  assert(edit.GetNewFilesNum()==1);
 
-    TryInstallMemtableFlushResults(&f_job, versions_, f_job.sst, &edit);
+    if (s.ok()) {
+        s = TryInstallMemtableFlushResults(&f_job, versions_, f_job.sst, &edit);
+    } else {
+        std::unique_lock<std::mutex> rollback_lock(FlushPickMTX);
+        imm_.RollbackMemtableFlush(f_job.mem_vec, f_job.sst != nullptr ? f_job.sst->number : 0);
+    }
+    if (!s.ok()) {
+        RecordBackgroundError(s);
+    }
     //  MaybeScheduleFlushOrCompaction();
     if (s.ok() && shutting_down_.load(std::memory_order_acquire)) {
         s = Status::IOError("Deleting DB during memtable compaction");
@@ -2305,7 +2330,9 @@ Status DBImpl::TryInstallMemtableFlushResults(FlushJob* job, VersionSet* vset,
             break;
         }
         assert(m->sstable != nullptr);
-        edit->AddFileIfNotExist(0, m->sstable);
+        if (m->sstable->file_size > 0) {
+            edit->AddFileIfNotExist(0, m->sstable);
+        }
         batch_count++;
     }
     if (batch_count == 0) {
@@ -3186,7 +3213,8 @@ void DBImpl::install_version_edit_handler(RDMA_Request* request, std::string cli
     delete request;
 }
 
-void DBImpl::bucket_meta_update_handler(RDMA_Request* request) {
+void DBImpl::bucket_meta_update_handler(void* request_ptr) {
+    RDMA_Request* request = static_cast<RDMA_Request*>(request_ptr);
     if (request == nullptr) {
         return;
     }
@@ -4049,6 +4077,30 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key, std::string* va
 
     Version::GetStats stats;
 
+    bool read_sst = true;
+    bool bucket_checked = false;
+    SequenceNumber cutover_sequence = 0;
+    size_t shard_idx = 0;
+    if (GetShardIndexForKey(key, &shard_idx)) {
+        read_sst = ShouldReadSSTForKey(key, shard_idx, &cutover_sequence);
+    }
+
+    // Once a subrange is bucket-only, the bucket is its primary read path.
+    // Keep falling back to the memtable below when the bucket misses, because
+    // a concurrent write publishes to the memtable before its bucket update
+    // has completed.
+    if (options.snapshot == nullptr && !read_sst) {
+        bucket_checked = true;
+        Status bucket_status;
+        SequenceNumber bucket_seq = 0;
+        bool bucket_deletion = false;
+        if (TryGetValueFromBucket(shard_idx, key, value, &bucket_seq, &bucket_deletion, &bucket_status) &&
+            bucket_seq <= snapshot) {
+            ReturnAndCleanupSuperVersion(sv);
+            return bucket_deletion ? Status::NotFound("deleted in hot bucket") : Status::OK();
+        }
+    }
+
     // Unlock while reading from files and memtables
     {
         //    undefine_mutex.Unlock();
@@ -4059,14 +4111,12 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key, std::string* va
             // Done
         } else if (imm != nullptr && imm->Get(lkey, value, &s)) {
             // Done
+        } else if (bucket_checked) {
+            // The bucket-only fast path above already checked the bucket.
+            // Do not issue the same synchronous bucket-table/value-zone RDMA
+            // sequence again on a miss; existing cold data remains in SST.
+            s = current->Get(options, lkey, value, &stats);
         } else {
-            bool read_sst = true;
-            SequenceNumber cutover_sequence = 0;
-            size_t shard_idx = 0;
-            if (GetShardIndexForKey(key, &shard_idx)) {
-                read_sst = ShouldReadSSTForKey(key, shard_idx, &cutover_sequence);
-            }
-
             Status bucket_status;
             SequenceNumber bucket_seq = 0;
             bool bucket_deletion = false;
@@ -4078,8 +4128,10 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key, std::string* va
                     s = current->Get(options, lkey, value, &stats);
                 }
             } else if (!read_sst) {
-                // bucket-only 子范围：无需再回退读 SST。
-                s = bucket_status;
+                // Existing cold data can still reside only in SST when a
+                // region first becomes hot. A bucket miss must therefore
+                // fall back to SST; bucket hits remain the primary path.
+                s = current->Get(options, lkey, value, &stats);
             } else {
                 s = current->Get(options, lkey, value, &stats);
             }
@@ -4193,6 +4245,10 @@ bool DBImpl::IsHotKey(const Slice& user_key) {
 
     std::lock_guard<std::mutex> lock(hot_stats_mutex_);
     return hot_region_set_.find(shard_idx) != hot_region_set_.end();
+}
+
+void DBImpl::RecordWriteAccess(const Slice& user_key) {
+    RecordKeyAccess(user_key, true);
 }
 
 // 基于指数衰减的滑动窗口，计算并更新所有 shard 的热度评分
@@ -4434,6 +4490,7 @@ Status DBImpl::Hot2Cold(size_t shard_idx) {
     asm volatile("lfence\n" : :);
     asm volatile("mfence\n" : :);
 
+    std::lock_guard<std::mutex> main_send_lock(rdma_mg->main_send_cq_mutex);
     rdma_mg->post_send<RDMA_Request>(&send_mr, shard_target_node_id, std::string("main"));
     ibv_wc wc[2] = {};
     if (rdma_mg->poll_completion(wc, 1, std::string("main"), true, shard_target_node_id)) {
@@ -4519,6 +4576,7 @@ Status DBImpl::Cold2Hot(size_t shard_idx) {
     asm volatile("lfence\n" : :);
     asm volatile("mfence\n" : :);
 
+    std::unique_lock<std::mutex> main_send_lock(rdma_mg->main_send_cq_mutex);
     rdma_mg->post_send<RDMA_Request>(&send_mr, shard_target_node_id, std::string("main"));
     ibv_wc wc[2] = {};
     if (rdma_mg->poll_completion(wc, 1, std::string("main"), true, shard_target_node_id)) {
@@ -4539,6 +4597,7 @@ Status DBImpl::Cold2Hot(size_t shard_idx) {
         rdma_mg->Deallocate_Local_RDMA_Slot(receive_mr.addr, Message);
         return Status::IOError("Cold2Hot: memory-side transition failed");
     }
+    main_send_lock.unlock();
 
     if (value_zone_ == nullptr) {
         value_zone_ = std::make_shared<ValueZone>(nullptr, VALUE_ZONE_MAX_SIZE, rdma_mg);
@@ -4547,31 +4606,6 @@ Status DBImpl::Cold2Hot(size_t shard_idx) {
     rdma_mg->Deallocate_Local_RDMA_Slot(send_mr.addr, Message);
     rdma_mg->Deallocate_Local_RDMA_Slot(receive_mr.addr, Message);
     return Status::OK();
-}
-
-void DBImpl::DisableBucketOnlyReads(size_t shard_idx) {
-    std::lock_guard<std::mutex> lock(bucket_meta_mu_);
-    bucket_migration_meta_by_shard_.erase(shard_idx);
-}
-
-Status DBImpl::ApplyHotWrite(const Slice& key, const Slice& value, SequenceNumber sequence, bool is_deletion) {
-    size_t shard_idx = 0;
-    if (!GetShardIndexForKey(key, &shard_idx)) {
-        return Status::OK();
-    }
-    {
-        std::lock_guard<std::mutex> lock(hot_stats_mutex_);
-        if (hot_region_set_.find(shard_idx) == hot_region_set_.end()) {
-            return Status::OK();
-        }
-    }
-    if (value_zone_ == nullptr || bucket_table_handler_ == nullptr || env_ == nullptr || env_->rdma_mg == nullptr) {
-        return Status::IOError("ApplyHotWrite: hot bucket is not initialized");
-    }
-
-    BucketTableBuilder builder(value_zone_, env_->rdma_mg, shard_target_node_id);
-    builder.Add(key, value, sequence, is_deletion);
-    return builder.Finish();
 }
 
 Status DBImpl::Put(const WriteOptions& o, const Slice& key, const Slice& val) {
@@ -4658,22 +4692,18 @@ Status DBImpl::Delete(const WriteOptions& options, const Slice& key) {
 //  return status;
 //}
 namespace {
-struct HotWriteOperation {
-    std::string key;
-    std::string value;
-    bool is_deletion = false;
-};
-
-class HotWriteCollector : public WriteBatch::Handler {
+class WriteAccessRecorder : public WriteBatch::Handler {
 public:
+    explicit WriteAccessRecorder(DBImpl* db) : db_(db) {}
     void Put(const Slice& key, const Slice& value) override {
-        operations.push_back({key.ToString(), value.ToString(), false});
+        (void)value;
+        db_->RecordWriteAccess(key);
     }
     void Delete(const Slice& key) override {
-        operations.push_back({key.ToString(), std::string(), true});
+        db_->RecordWriteAccess(key);
     }
-
-    std::vector<HotWriteOperation> operations;
+private:
+    DBImpl* db_;
 };
 }  // namespace
 
@@ -4690,7 +4720,6 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
     auto total_start = std::chrono::high_resolution_clock::now();
 #endif
     size_t kv_num = WriteBatchInternal::Count(updates);
-    assert(kv_num == 1);
     uint64_t sequence = versions_->AssignSequnceNumbers(kv_num);
     // todo: remove
     //  kv_counter0.fetch_add(1);
@@ -4750,29 +4779,9 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
         printf("Weird status not OK");
         assert(0 == 1);
     }
-    if (status.ok() && updates != nullptr) {
-        HotWriteCollector collector;
-        Status collect_status = updates->Iterate(&collector);
-        if (!collect_status.ok()) {
-            status = collect_status;
-        } else {
-            SequenceNumber operation_sequence = sequence;
-            for (const auto& operation : collector.operations) {
-                Slice operation_key(operation.key);
-                RecordKeyAccess(operation_key, true);
-                Status bucket_status = ApplyHotWrite(operation_key, Slice(operation.value), operation_sequence,
-                                                     operation.is_deletion);
-                if (!bucket_status.ok()) {
-                    size_t shard_idx = 0;
-                    if (GetShardIndexForKey(operation_key, &shard_idx)) {
-                        DisableBucketOnlyReads(shard_idx);
-                    }
-                    std::fprintf(stderr, "hot bucket update failed for key %s: %s\n",
-                                 operation.key.c_str(), bucket_status.ToString().c_str());
-                }
-                ++operation_sequence;
-            }
-        }
+    if (status.ok() && updates != nullptr && options.track_hotness) {
+        WriteAccessRecorder recorder(this);
+        status = updates->Iterate(&recorder);
     }
 //  kv_counter1.fetch_add(1);
 //  if (mem_switching){}
@@ -4852,13 +4861,13 @@ Status DBImpl::PickupTableToWrite(bool force, uint64_t seq_num, MemTable*& mem_r
                 versions_->NumLevelFiles(0) <= config::kL0_StopWritesTrigger &&
                 seq_num > mem_r->Getlargest_seq_supposed()) {
                 assert(versions_->PrevLogNumber() == 0);
-                MemTable* temp_mem = new MemTable(internal_comparator_);
+                MemTable* temp_mem = new MemTable(internal_comparator_, memtable_sequence_size_);
                 uint64_t last_mem_seq = mem_r->Getlargest_seq_supposed();
                 // The memtable seq barrier is (  ];
                 temp_mem->SetFirstSeq(last_mem_seq + 1);
                 // starting from this sequenctial number, the data should write the the new memtable
                 // set the immutable as seq_num - 1
-                temp_mem->SetLargestSeq(last_mem_seq + MEMTABLE_SEQ_SIZE);
+                temp_mem->SetLargestSeq(last_mem_seq + memtable_sequence_size_);
                 temp_mem->Ref();
                 mem_r->SetFlushState(MemTable::FLUSH_REQUESTED);
                 mem_.store(temp_mem);
@@ -5270,9 +5279,9 @@ Status DB::Open(const Options& options, const std::string& dbname, DB** dbptr) {
                 impl->logfile_ = lfile;
                 impl->logfile_number_ = new_log_number;
                 impl->log_ = new log::Writer(lfile);
-                impl->mem_ = new MemTable(impl->internal_comparator_);
+                impl->mem_ = new MemTable(impl->internal_comparator_, impl->memtable_sequence_size_);
                 impl->mem_.load()->SetFirstSeq(0);
-                impl->mem_.load()->SetLargestSeq(MEMTABLE_SEQ_SIZE - 1);
+                impl->mem_.load()->SetLargestSeq(impl->memtable_sequence_size_ - 1);
                 impl->mem_.load()->Ref();
             }
         }
@@ -5327,9 +5336,9 @@ Status DB::Open(const Options& options, const std::string& dbname, DB** dbptr) {
                     impl->logfile_ = lfile;
                     impl->logfile_number_ = new_log_number;
                     impl->log_ = new log::Writer(lfile);
-                    impl->mem_ = new MemTable(impl->internal_comparator_);
+                    impl->mem_ = new MemTable(impl->internal_comparator_, impl->memtable_sequence_size_);
                     impl->mem_.load()->SetFirstSeq(0);
-                    impl->mem_.load()->SetLargestSeq(MEMTABLE_SEQ_SIZE - 1);
+                    impl->mem_.load()->SetLargestSeq(impl->memtable_sequence_size_ - 1);
                     impl->mem_.load()->Ref();
                 }
             }

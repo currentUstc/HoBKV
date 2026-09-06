@@ -83,7 +83,7 @@ struct TableBuilder_BAMS::Rep {
     ibv_mr* local_index_mr;
     ibv_mr* local_filter_mr;
     // TODO: make the map offset -> ibv_mr*
-    std::map<uint32_t, ibv_mr*> local_data_mrs;
+    std::map<uint64_t, ibv_mr*> local_data_mrs;
     std::map<uint32_t, ibv_mr*> local_dataindex_mrs;
     std::map<uint32_t, ibv_mr*> local_filter_mrs;
     //  std::vector<size_t> remote_mr_real_length;
@@ -525,7 +525,7 @@ uint64_t TableBuilder_BAMS::NumEntries() const {
 uint64_t TableBuilder_BAMS::FileSize() const {
     return rep_->offset;
 }
-void TableBuilder_BAMS::get_datablocks_map(std::map<uint32_t, ibv_mr*>& map) {
+void TableBuilder_BAMS::get_datablocks_map(std::map<uint64_t, ibv_mr*>& map) {
     map = rep_->local_data_mrs;
 }
 void TableBuilder_BAMS::get_dataindexblocks_map(std::map<uint32_t, ibv_mr*>& map) {

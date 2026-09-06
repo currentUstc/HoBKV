@@ -60,29 +60,44 @@ Status Footer::DecodeFrom(Slice* input) {
     }
     return result;
 }
-void Find_Remote_MR(std::map<uint32_t, ibv_mr*>* remote_data_blocks, const BlockHandle& handle, ibv_mr* remote_mr) {
+bool Find_Remote_MR(std::map<uint64_t, ibv_mr*>* remote_data_blocks, const BlockHandle& handle, ibv_mr* remote_mr) {
     uint64_t position = handle.offset();
-    //  auto iter = remote_data_blocks.begin();
     auto iter = remote_data_blocks->upper_bound(position);
-    position = position - (iter->first - iter->second->length);
-    //  assert(position + handle.size() + kBlockTrailerSize <= iter->second->length);
-    //  assert(handle.size() +kBlockTrailerSize <= )
+    if (iter == remote_data_blocks->end() || iter->second == nullptr ||
+        iter->first < iter->second->length) {
+        return false;
+    }
+    const uint64_t chunk_start = iter->first - iter->second->length;
+    if (position < chunk_start || handle.size() > iter->second->length ||
+        position - chunk_start > iter->second->length - handle.size() ||
+        kBlockTrailerSize > iter->second->length - handle.size() - (position - chunk_start)) {
+        return false;
+    }
+    position -= chunk_start;
     *(remote_mr) = *(iter->second);
-    //      DEBUG_arg("Block buffer position %lu\n", position);
     remote_mr->addr = static_cast<void*>(static_cast<char*>(iter->second->addr) + position);
+    remote_mr->length = handle.size() + kBlockTrailerSize;
+    return true;
 }
 
-void Find_Local_MR(std::map<uint32_t, ibv_mr*>* remote_data_blocks, const BlockHandle& handle, Slice& data) {
+bool Find_Local_MR(std::map<uint64_t, ibv_mr*>* remote_data_blocks, const BlockHandle& handle, Slice& data) {
     uint64_t position = handle.offset();
-    //  auto iter = remote_data_blocks.begin();
     auto iter = remote_data_blocks->upper_bound(position);
-    position = position - (iter->first - iter->second->length);
-    //  assert(position + handle.size() + kBlockTrailerSize <= iter->second->length);
-    //  assert(handle.size() +kBlockTrailerSize <= )
-    //      DEBUG_arg("Block buffer position %lu\n", position);
+    if (iter == remote_data_blocks->end() || iter->second == nullptr ||
+        iter->first < iter->second->length) {
+        return false;
+    }
+    const uint64_t chunk_start = iter->first - iter->second->length;
+    if (position < chunk_start || handle.size() > iter->second->length ||
+        position - chunk_start > iter->second->length - handle.size() ||
+        kBlockTrailerSize > iter->second->length - handle.size() - (position - chunk_start)) {
+        return false;
+    }
+    position -= chunk_start;
     data.Reset((static_cast<char*>(iter->second->addr) + position), handle.size());
+    return true;
 }
-bool Find_prefetch_MR(std::map<uint32_t, ibv_mr*>* remote_data_blocks, const size_t& offset, ibv_mr* remote_mr) {
+bool Find_prefetch_MR(std::map<uint64_t, ibv_mr*>* remote_data_blocks, const size_t& offset, ibv_mr* remote_mr) {
     uint64_t position = offset;
     //  auto iter = remote_data_blocks.begin();
     auto iter = remote_data_blocks->upper_bound(position);
@@ -100,7 +115,7 @@ bool Find_prefetch_MR(std::map<uint32_t, ibv_mr*>* remote_data_blocks, const siz
 }
 // TODO: Make the block mr searching and creating outside this function, so that datablock is
 //  the same as data index block and filter block.
-Status ReadDataBlock(std::map<uint32_t, ibv_mr*>* remote_data_blocks, const ReadOptions& options,
+Status ReadDataBlock(std::map<uint64_t, ibv_mr*>* remote_data_blocks, const ReadOptions& options,
                      const BlockHandle& handle, BlockContents* result, uint8_t target_node_id) {
     // TODO: Make it use thread local read buffer rather than allocate one every time.
     // #ifdef GETANALYSIS
@@ -125,7 +140,9 @@ Status ReadDataBlock(std::map<uint32_t, ibv_mr*>* remote_data_blocks, const Read
 #ifdef GETANALYSIS
     auto start1 = std::chrono::high_resolution_clock::now();
 #endif
-    Find_Remote_MR(remote_data_blocks, handle, &remote_mr);
+    if (!Find_Remote_MR(remote_data_blocks, handle, &remote_mr)) {
+        return Status::Corruption("data block outside RDMA chunk");
+    }
 #ifdef GETANALYSIS
     auto stop1 = std::chrono::high_resolution_clock::now();
     auto duration1 = std::chrono::duration_cast<std::chrono::nanoseconds>(stop1 - start1);
@@ -160,13 +177,12 @@ Status ReadDataBlock(std::map<uint32_t, ibv_mr*>* remote_data_blocks, const Read
     //  printf("/Create buffer for cache, start addr %p, length %lu content is %s\n", data, n, data+1);
 
     //  const char* data = static_cast<char*>(contents->addr);  // Pointer to where Read put the data
-    if (options.verify_checksums) {
+    {
         const uint32_t crc = crc32c::Unmask(DecodeFixed32(buf + n + 1));
         const uint32_t actual = crc32c::Value(buf, n + 1);
         if (actual != crc) {
-            //      delete[] buf;
-            DEBUG("Data block Checksum mismatch\n");
-            assert(false);
+            std::fprintf(stderr, "Data block checksum mismatch: offset=%llu size=%zu\n",
+                         static_cast<unsigned long long>(handle.offset()), n);
             s = Status::Corruption("block checksum mismatch");
             return s;
         }
@@ -174,8 +190,11 @@ Status ReadDataBlock(std::map<uint32_t, ibv_mr*>* remote_data_blocks, const Read
     //  printf("data[n] is %c\n", data[n]);
     switch (buf[n]) {
         case kNoCompression: {
-            char* data = new char[rdma_mg->name_to_chunksize.at(DataChunk)];
-            memcpy(data, contents->addr, rdma_mg->name_to_chunksize.at(DataChunk));
+            // DataChunk follows options.block_size and can be much smaller
+            // than a large value.  The returned Slice owns one complete
+            // decoded block, so size the allocation from the block handle.
+            char* data = new char[n];
+            memcpy(data, contents->addr, n);
 
             result->data = Slice(data, n);
             //        result->heap_allocated = false;
@@ -214,7 +233,7 @@ Status ReadDataBlock(std::map<uint32_t, ibv_mr*>* remote_data_blocks, const Read
     // #endif
     return Status::OK();
 }
-Status ReadKVPair(std::map<uint32_t, ibv_mr*>* remote_data_blocks, const ReadOptions& options,
+Status ReadKVPair(std::map<uint64_t, ibv_mr*>* remote_data_blocks, const ReadOptions& options,
                   const BlockHandle& handle, Slice* result, uint8_t target_node_id) {
     // #ifdef GETANALYSIS
     //   auto start = std::chrono::high_resolution_clock::now();
@@ -244,7 +263,9 @@ Status ReadKVPair(std::map<uint32_t, ibv_mr*>* remote_data_blocks, const ReadOpt
 #ifdef GETANALYSIS
     auto start1 = std::chrono::high_resolution_clock::now();
 #endif
-    Find_Remote_MR(remote_data_blocks, handle, &remote_mr);
+    if (!Find_Remote_MR(remote_data_blocks, handle, &remote_mr)) {
+        return Status::Corruption("KV block outside RDMA chunk");
+    }
 #ifdef GETANALYSIS
     auto stop1 = std::chrono::high_resolution_clock::now();
     auto duration1 = std::chrono::duration_cast<std::chrono::nanoseconds>(stop1 - start1);

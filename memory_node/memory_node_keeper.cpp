@@ -326,6 +326,7 @@ void Memory_Node_Keeper::RecomputeBucketMigrationMeta(BucketMigrationMeta* meta)
 
 void Memory_Node_Keeper::SendBucketMetaUpdateToCompute(const BucketMigrationMeta& meta, const std::string& client_ip,
                                                        uint8_t target_node_id) {
+    std::lock_guard<std::mutex> main_send_lock(rdma_mg->main_send_cq_mutex);
     ibv_mr send_mr = {};
     rdma_mg->Allocate_Local_RDMA_Slot(send_mr, Message);
     RDMA_Request* send_pointer = reinterpret_cast<RDMA_Request*>(send_mr.addr);
@@ -1503,6 +1504,9 @@ Status Memory_Node_Keeper::InstallCompactionResults(CompactionState* compact, st
     if (compact->sub_compact_states.size() == 0) {
         for (size_t i = 0; i < compact->outputs.size(); i++) {
             const CompactionOutput& out = compact->outputs[i];
+            if (out.remote_data_mrs.empty() || out.remote_dataindex_mrs.empty()) {
+                continue;
+            }
             std::shared_ptr<RemoteMemTableMetaData> meta = std::make_shared<RemoteMemTableMetaData>(1);
             meta->shard_target_node_id = rdma_mg->node_id;
             // TODO make all the metadata written into out
@@ -1535,6 +1539,9 @@ Status Memory_Node_Keeper::InstallCompactionResults(CompactionState* compact, st
         for (auto subcompact : compact->sub_compact_states) {
             for (size_t i = 0; i < subcompact.outputs.size(); i++) {
                 const CompactionOutput& out = subcompact.outputs[i];
+                if (out.remote_data_mrs.empty() || out.remote_dataindex_mrs.empty()) {
+                    continue;
+                }
                 std::shared_ptr<RemoteMemTableMetaData> meta = std::make_shared<RemoteMemTableMetaData>(1);
                 meta->shard_target_node_id = rdma_mg->node_id;  // this id is important.
                 // TODO make all the metadata written into out
@@ -1577,6 +1584,9 @@ Status Memory_Node_Keeper::InstallCompactionResultsToComputePreparation(Compacti
     if (compact->sub_compact_states.size() == 0) {
         for (size_t i = 0; i < compact->outputs.size(); i++) {
             const CompactionOutput& out = compact->outputs[i];
+            if (out.remote_data_mrs.empty() || out.remote_dataindex_mrs.empty()) {
+                continue;
+            }
             std::shared_ptr<RemoteMemTableMetaData> meta = std::make_shared<RemoteMemTableMetaData>(1);
             meta->shard_target_node_id = rdma_mg->node_id;  // this id is important.
             // TODO make all the metadata written into out
@@ -1597,6 +1607,9 @@ Status Memory_Node_Keeper::InstallCompactionResultsToComputePreparation(Compacti
         for (auto subcompact : compact->sub_compact_states) {
             for (size_t i = 0; i < subcompact.outputs.size(); i++) {
                 const CompactionOutput& out = subcompact.outputs[i];
+                if (out.remote_data_mrs.empty() || out.remote_dataindex_mrs.empty()) {
+                    continue;
+                }
                 std::shared_ptr<RemoteMemTableMetaData> meta = std::make_shared<RemoteMemTableMetaData>(1);
                 meta->shard_target_node_id = rdma_mg->node_id;  // this id is important.
                 // TODO make all the metadata written into out
@@ -2075,12 +2088,17 @@ void Memory_Node_Keeper::create_cpu_util_heart_beater_sender() {
                 }
                 // #endif
 
-                rdma_mg->post_send<RDMA_Request>(&send_mr, iter.first, std::string("main"));
-                ibv_wc wc[2] = {};
-                if (rdma_mg->poll_completion(wc, 1, std::string("main"), true, iter.first)) {
-                    fprintf(stderr, "failed to poll send for remote memory register\n");
-                    return;
+                {
+                    std::lock_guard<std::mutex> main_send_lock(rdma_mg->main_send_cq_mutex);
+                    rdma_mg->post_send<RDMA_Request>(&send_mr, iter.first, std::string("main"));
+                    ibv_wc wc[2] = {};
+                    if (rdma_mg->poll_completion(wc, 1, std::string("main"), true, iter.first)) {
+                        rdma_mg->Deallocate_Local_RDMA_Slot(send_mr.addr, Message);
+                        fprintf(stderr, "failed to poll CPU heartbeat send\n");
+                        return;
+                    }
                 }
+                rdma_mg->Deallocate_Local_RDMA_Slot(send_mr.addr, Message);
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(CPU_UTILIZATION_CACULATE_INTERVAL));
         }
@@ -2341,7 +2359,8 @@ void Memory_Node_Keeper::flush_helper_handler(void* arg) {
     remote_mr.addr = request->buffer_large;
     remote_mr.rkey = request->rkey_large;
     if (buffer_size > 0) {
-        rdma_mg->RDMA_Read(&remote_mr, &updates_mr, buffer_size, client_ip, IBV_SEND_SIGNALED, 1, target_node_id);
+        rdma_mg->RDMA_Read(&remote_mr, &updates_mr, buffer_size, client_ip,
+                           IBV_SEND_SIGNALED, 1, target_node_id);
     }
 
     const size_t pair_size = sizeof(uint64_t) * 4;
@@ -2404,8 +2423,8 @@ void Memory_Node_Keeper::flush_helper_handler(void* arg) {
     *send_pointer = {};
     send_pointer->content.error_count = error_count;
     send_pointer->received = true;
-    rdma_mg->RDMA_Write(request->buffer, request->rkey, &send_mr, sizeof(RDMA_Reply), client_ip, IBV_SEND_SIGNALED, 1,
-                        target_node_id);
+    rdma_mg->RDMA_Write(request->buffer, request->rkey, &send_mr, sizeof(RDMA_Reply),
+                        client_ip, IBV_SEND_SIGNALED, 1, target_node_id);
 
     rdma_mg->Deallocate_Local_RDMA_Slot(send_mr.addr, Message);
     rdma_mg->Deallocate_Local_RDMA_Slot(updates_mr.addr, FlushBuffer);
@@ -2727,8 +2746,13 @@ void Memory_Node_Keeper::sst_compaction_handler(void* arg) {
     } else {
         status = DoCompactionWork(compact, client_ip);
     }
-    InstallCompactionResultsToComputePreparation(compact);
-    UpdateBucketMigrationMetaAfterCompaction(compact->compaction, client_ip, target_node_id);
+    if (status.ok()) {
+        InstallCompactionResultsToComputePreparation(compact);
+        UpdateBucketMigrationMetaAfterCompaction(compact->compaction, client_ip, target_node_id);
+    } else {
+        std::fprintf(stderr, "near-data compaction failed: %s\n", status.ToString().c_str());
+        compact->compaction->edit()->Clear();
+    }
     // TODO:Send back the new created sstables and wait for another reply.
     std::string serilized_ve;
 #ifndef NDEBUG

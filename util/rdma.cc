@@ -39,7 +39,7 @@ void Destroy_mr(void* ptr) {
     if (ptr == nullptr) return;
     auto target_add = (char*)((ibv_mr*)ptr)->addr;
     ibv_dereg_mr((ibv_mr*)ptr);
-    delete target_add;
+    delete[] target_add;
 }
 template <typename T>
 void General_Destroy(void* ptr) {
@@ -237,8 +237,6 @@ bool RDMA_Manager::poll_reply_buffer(RDMA_Reply* rdma_reply) {
         asm volatile("sfence\n" : :);
         asm volatile("lfence\n" : :);
         asm volatile("mfence\n" : :);
-        std::fprintf(stderr, "Polling reply buffer\r");
-        std::fflush(stderr);
         //    counter++;
         //    if (counter == 1000000){
         //      printf("Polling not get a result\n");
@@ -685,6 +683,13 @@ void RDMA_Manager::compute_message_handling_thread(std::string q_id, uint8_t sha
                 // handle the heartbeat, record the cpu utilization and core number of the remote memory
                 post_receive<RDMA_Request>(&recv_mr[buffer_counter], shard_target_node_id, "main");
                 remote_cpu_util_heart_beater_receiver(receive_msg_buf, shard_target_node_id);
+            } else if (receive_msg_buf->command == bucket_meta_update) {
+                post_receive<RDMA_Request>(&recv_mr[buffer_counter], shard_target_node_id, "main");
+                if (DB_handler != nullptr) {
+                    DB_handler->bucket_meta_update_handler(receive_msg_buf);
+                } else {
+                    delete receive_msg_buf;
+                }
             } else {
                 printf("corrupt message from client.");
                 break;
@@ -1366,10 +1371,11 @@ ibv_mr* RDMA_Manager::Get_local_read_mr() {
     ibv_mr* ret;
     ret = (ibv_mr*)read_buffer->Get();
     if (ret == nullptr) {
-        char* buffer = new char[name_to_chunksize.at(DataChunk)];
+        const size_t read_buffer_size = std::max<size_t>(name_to_chunksize.at(DataChunk), 1024 * 1024);
+        char* buffer = new char[read_buffer_size];
         auto mr_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
         //  auto start = std::chrono::high_resolution_clock::now();
-        ret = ibv_reg_mr(res->pd, buffer, name_to_chunksize.at(DataChunk), mr_flags);
+        ret = ibv_reg_mr(res->pd, buffer, read_buffer_size, mr_flags);
         read_buffer->Reset(ret);
     }
     return ret;
@@ -1915,6 +1921,11 @@ End of socket operations
 // return 0 means success
 int RDMA_Manager::RDMA_Read(ibv_mr* remote_mr, ibv_mr* local_mr, size_t msg_size, std::string qp_type, size_t send_flag,
                             int poll_num, uint8_t target_node_id) {
+    std::unique_lock<std::mutex> main_send_lock(main_send_cq_mutex, std::defer_lock);
+    if (qp_type != "read_local" && qp_type != "write_local_flush" &&
+        qp_type != "write_local_compact") {
+        main_send_lock.lock();
+    }
     // #ifdef GETANALYSIS
     //   auto start = std::chrono::high_resolution_clock::now();
     // #endif
@@ -2025,6 +2036,11 @@ int RDMA_Manager::RDMA_Read(ibv_mr* remote_mr, ibv_mr* local_mr, size_t msg_size
 }
 int RDMA_Manager::RDMA_Write(ibv_mr* remote_mr, ibv_mr* local_mr, size_t msg_size, std::string qp_type,
                              size_t send_flag, int poll_num, uint8_t target_node_id) {
+    std::unique_lock<std::mutex> main_send_lock(main_send_cq_mutex, std::defer_lock);
+    if (qp_type != "read_local" && qp_type != "write_local_flush" &&
+        qp_type != "write_local_compact") {
+        main_send_lock.lock();
+    }
     //  auto start = std::chrono::high_resolution_clock::now();
     struct ibv_send_wr sr;
     struct ibv_sge sge;
@@ -2109,6 +2125,11 @@ int RDMA_Manager::RDMA_Write(ibv_mr* remote_mr, ibv_mr* local_mr, size_t msg_siz
 }
 int RDMA_Manager::RDMA_Write(void* addr, uint32_t rkey, ibv_mr* local_mr, size_t msg_size, std::string qp_type,
                              size_t send_flag, int poll_num, uint8_t target_node_id) {
+    std::unique_lock<std::mutex> main_send_lock(main_send_cq_mutex, std::defer_lock);
+    if (qp_type != "read_local" && qp_type != "write_local_flush" &&
+        qp_type != "write_local_compact") {
+        main_send_lock.lock();
+    }
     //  auto start = std::chrono::high_resolution_clock::now();
     struct ibv_send_wr sr;
     struct ibv_sge sge;
@@ -2814,7 +2835,10 @@ void RDMA_Manager::usage(const char* argv0) {
 }
 
 bool RDMA_Manager::Remote_Memory_Register(size_t size, uint8_t target_node_id, Chunk_type c_type) {
-    //  std::unique_lock<std::shared_mutex> l(main_qp_mutex);
+    // Registration is also a request/reply exchange on the main QP. Without
+    // this lock it can consume (or lose) a completion belonging to a hot-write
+    // flush, a transition RPC, or a bucket read.
+    std::lock_guard<std::mutex> main_send_lock(main_send_cq_mutex);
     // register the memory block from the remote memory
 
     RDMA_Request* send_pointer;
@@ -2902,6 +2926,7 @@ bool RDMA_Manager::Print_Remote_CPU_RPC(uint8_t target_node_id) {
     return true;
 }
 bool RDMA_Manager::Remote_Query_Pair_Connection(std::string& qp_type, uint8_t target_node_id) {
+    std::lock_guard<std::mutex> main_send_lock(main_send_cq_mutex);
     ibv_qp* qp = create_qp(target_node_id, false, qp_type);
 
     union ibv_gid my_gid;

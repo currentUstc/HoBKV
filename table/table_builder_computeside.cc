@@ -4,8 +4,10 @@
 
 #include "table_builder_computeside.h"
 
-#include "db/dbformat.h"
+#include <algorithm>
 #include <cassert>
+
+#include "db/dbformat.h"
 
 namespace TimberSaw {
 // TOthink: how to save the remote mr?
@@ -82,7 +84,7 @@ struct TableBuilder_ComputeSide::Rep {
     std::vector<ibv_mr*> local_index_mr;
     std::vector<ibv_mr*> local_filter_mr;
     // TODO: make the map offset -> ibv_mr*
-    std::map<uint32_t, ibv_mr*> remote_data_mrs;
+    std::map<uint64_t, ibv_mr*> remote_data_mrs;
     std::map<uint32_t, ibv_mr*> remote_dataindex_mrs;
     std::map<uint32_t, ibv_mr*> remote_filter_mrs;
     //  std::vector<size_t> remote_mr_real_length;
@@ -181,11 +183,17 @@ void TableBuilder_ComputeSide::Add(const Slice& key, const Slice& value) {
     // *   Second, if new block finished, check whether the write buffer can hold a new block size.
     // *           if not, the flush temporal buffer content to the remote memory.
     const size_t estimated_block_size = r->data_block->CurrentSizeEstimate();
+    const size_t required_block_capacity =
+        key.size() + value.size() + sizeof(size_t) + 3 * sizeof(uint32_t) + kBlockTrailerSize;
     // maximize added length to the block is key size + value size + restart point + shared, nonshared, valuesize
     if (estimated_block_size + key.size() + value.size() + sizeof(size_t) + 3 * sizeof(uint32_t) + kBlockTrailerSize >=
         r->options.block_size) {
         UpdateFunctionBLock();
-        if (r->local_data_mr[0]->length - (r->offset - r->offset_last_flushed) < r->options.block_size) {
+        // A value can be much larger than options.block_size (for example the
+        // 100KB benchmark values).  Reserve space for the actual next block,
+        // not merely the configured target block size, before appending it.
+        if (r->local_data_mr[0]->length - (r->offset - r->offset_last_flushed) <
+            std::max(r->options.block_size, required_block_capacity)) {
             FlushData();
         }
     }
@@ -658,7 +666,7 @@ uint64_t TableBuilder_ComputeSide::NumEntries() const {
 uint64_t TableBuilder_ComputeSide::FileSize() const {
     return rep_->offset;
 }
-void TableBuilder_ComputeSide::get_datablocks_map(std::map<uint32_t, ibv_mr*>& map) {
+void TableBuilder_ComputeSide::get_datablocks_map(std::map<uint64_t, ibv_mr*>& map) {
     map = rep_->remote_data_mrs;
 }
 void TableBuilder_ComputeSide::get_dataindexblocks_map(std::map<uint32_t, ibv_mr*>& map) {

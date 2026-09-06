@@ -86,7 +86,7 @@ struct TableBuilder_Memoryside::Rep {
     ibv_mr* local_index_mr;
     ibv_mr* local_filter_mr;
     // TODO: make the map offset -> ibv_mr*
-    std::map<uint32_t, ibv_mr*> local_data_mrs;
+    std::map<uint64_t, ibv_mr*> local_data_mrs;
     std::map<uint32_t, ibv_mr*> local_dataindex_mrs;
     std::map<uint32_t, ibv_mr*> local_filter_mrs;
     //  std::vector<size_t> remote_mr_real_length;
@@ -183,10 +183,16 @@ void TableBuilder_Memoryside::Add(const Slice& key, const Slice& value) {
     // *   Second, if new block finished, check whether the write buffer can hold a new block size.
     // *           if not, the flush temporal buffer content to the remote memory.
     const size_t estimated_block_size = r->data_block->CurrentSizeEstimate();
+    const size_t required_block_capacity =
+        key.size() + value.size() + sizeof(size_t) + 3 * sizeof(uint32_t) + kBlockTrailerSize;
     if (estimated_block_size + key.size() + value.size() + sizeof(size_t) + kBlockTrailerSize >=
         r->options.block_size) {
         UpdateFunctionBLock();
-        if (r->local_data_mr->length - (r->offset - r->offset_last_flushed) < r->options.block_size) {
+        // Compaction must obey the same large-value buffer rule as the
+        // compute-side flush builder.  Otherwise a 100KB value can overrun
+        // the tail of an 8MB RDMA slot and corrupt the following block CRC.
+        if (r->local_data_mr->length - (r->offset - r->offset_last_flushed) <
+            std::max(r->options.block_size, required_block_capacity)) {
             FlushData();
         }
     }
@@ -297,7 +303,7 @@ void TableBuilder_Memoryside::FinishDataBlock(BlockBuilder* block, BlockHandle* 
     // #endif
     handle->set_offset(r->offset);  // This is the offset of the begginning of this block.
     handle->set_size(block_contents->size());
-    assert(block_contents->size() <= r->options.block_size - kBlockTrailerSize);
+    assert(block_contents->size() + kBlockTrailerSize <= r->local_data_mr->length);
     if (r->status.ok()) {
         char trailer[kBlockTrailerSize];
         trailer[0] = compressiontype;
@@ -535,7 +541,7 @@ uint64_t TableBuilder_Memoryside::NumEntries() const {
 uint64_t TableBuilder_Memoryside::FileSize() const {
     return rep_->offset;
 }
-void TableBuilder_Memoryside::get_datablocks_map(std::map<uint32_t, ibv_mr*>& map) {
+void TableBuilder_Memoryside::get_datablocks_map(std::map<uint64_t, ibv_mr*>& map) {
     map = rep_->local_data_mrs;
 }
 void TableBuilder_Memoryside::get_dataindexblocks_map(std::map<uint32_t, ibv_mr*>& map) {

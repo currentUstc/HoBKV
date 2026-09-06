@@ -87,7 +87,7 @@ public:
                                       size_t& block_size) = 0;
     virtual void FinishFilterBlock(FullFilterBlockBuilder* block, BlockHandle* handle, CompressionType compressiontype,
                                    size_t& block_size) = 0;
-    virtual void get_datablocks_map(std::map<uint32_t, ibv_mr*>& map) = 0;
+    virtual void get_datablocks_map(std::map<uint64_t, ibv_mr*>& map) = 0;
     virtual void get_dataindexblocks_map(std::map<uint32_t, ibv_mr*>& map) = 0;
     virtual void get_filter_map(std::map<uint32_t, ibv_mr*>& map) = 0;
     virtual size_t get_numentries() = 0;

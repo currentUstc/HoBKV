@@ -491,6 +491,10 @@ public:
     std::shared_mutex remote_mem_mutex;
 
     std::shared_mutex rw_mutex;
+    // The main QP has one shared send CQ. Keep each post/completion exchange
+    // together so concurrent background handlers cannot consume each other's
+    // completion and leave one operation waiting forever.
+    std::mutex main_send_cq_mutex;
     //  std::shared_mutex main_qp_mutex;
     std::shared_mutex qp_cq_map_mutex;
     //  ThreadLocalPtr* t_local_1;

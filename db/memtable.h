@@ -12,6 +12,7 @@
 //  #define MEMTABLE_SEQ_SIZE 610081
 #include "db/dbformat.h"
 #include "db/inlineskiplist.h"
+#include <mutex>
 #include <string>
 
 #include "TimberSaw/db.h"
@@ -52,7 +53,7 @@ public:
     static std::atomic<uint64_t> GetNum;
     static std::atomic<uint64_t> foundNum;
 #endif
-    explicit MemTable(const InternalKeyComparator& cmp);
+    explicit MemTable(const InternalKeyComparator& cmp, uint64_t sequence_capacity = MEMTABLE_SEQ_SIZE);
     MemTable(const MemTable&) = delete;
     MemTable& operator=(const MemTable&) = delete;
     ~MemTable();
@@ -71,7 +72,7 @@ public:
             // TODO: THis assertion may changed in the future
 #ifndef NDEBUG
             if (full_table_flush) {
-                assert(seq_count.load() == MEMTABLE_SEQ_SIZE);
+                assert(seq_count.load() == sequence_capacity_);
             }
 
 #endif
@@ -128,22 +129,23 @@ public:
     uint64_t Getlargest_seq() const {
         // in case that there is a unfull table flush, the largest seq will be different
         // from the one supposed
-        return largest_seq_supposed - MEMTABLE_SEQ_SIZE + seq_count;
+        return largest_seq_supposed - sequence_capacity_ + seq_count;
     }
     uint64_t GetFirstseq() const { return first_seq; }
     void increase_seq_count(size_t num) {
         seq_count.fetch_add(num);
         assert(num == 1);
-        assert(seq_count <= MEMTABLE_SEQ_SIZE);
+        assert(seq_count <= sequence_capacity_);
         // TODO; For a write batch you the write may cross the boder, we need to modify
         //  the boder of the next table
-        if (seq_count >= MEMTABLE_SEQ_SIZE) {
+        if (seq_count >= sequence_capacity_) {
             able_to_flush.store(true);
         }
     }
     size_t Get_seq_count() { return seq_count; }
 
 private:
+    const uint64_t sequence_capacity_;
     friend class MemTableIterator;
     friend class MemTableBackwardIterator;
 
@@ -156,6 +158,7 @@ private:
     int64_t first_seq;
     std::atomic<int64_t> largest_seq_till_now = 0;
     int64_t largest_seq_supposed;
+    std::mutex table_write_mutex_;
 };
 
 }  // namespace TimberSaw

@@ -821,7 +821,9 @@ Status FlushJob::BuildTable(const std::string& dbname, Env* env, const Options& 
     ParsedInternalKey ikey;
     std::string current_user_key;
     bool has_current_user_key = false;
-    TableBuilder* builder;
+    std::unique_ptr<TableBuilder> builder;
+    std::string largest_cold_key;
+    bool has_hot_entries = false;
     std::shared_ptr<ValueZone> hot_value_zone;
     std::shared_ptr<RDMA_Manager> hot_rdma_mg;
     uint8_t hot_target_node_id = 0;
@@ -835,15 +837,6 @@ Status FlushJob::BuildTable(const std::string& dbname, Env* env, const Options& 
                                    collect_hot_kv ? hot_rdma_mg : nullptr,
                                    hot_target_node_id);
     if (iter->Valid()) {
-        // TODO: processing the KVs in hot area
-        if (table_type == block_based) {
-            builder = new TableBuilder_ComputeSide(options, type, target_node_id);
-
-        } else {
-            builder = new TableBuilder_BACS(options, type, target_node_id);
-        }
-        meta->table_type = table_type;
-        meta->smallest.DecodeFrom(iter->key());
         Slice key;
         for (; iter->Valid(); iter->Next()) {
             key = iter->key();
@@ -874,53 +867,67 @@ Status FlushJob::BuildTable(const std::string& dbname, Env* env, const Options& 
 #ifndef NDEBUG
                 Not_drop_counter++;
 #endif
-                builder->Add(key, iter->value());
-                if (collect_hot_kv && db_impl_->IsHotKey(ikey.user_key)) {
+                const bool is_hot = collect_hot_kv && db_impl_->IsHotKey(ikey.user_key);
+                if (is_hot) {
                     hot_builder.Add(ikey.user_key, iter->value(), ikey.sequence,
                                     ikey.type == kTypeDeletion);
+                    has_hot_entries = true;
+                } else {
+                    if (builder == nullptr) {
+                        if (table_type == block_based) {
+                            builder.reset(new TableBuilder_ComputeSide(options, type, target_node_id));
+                        } else {
+                            builder.reset(new TableBuilder_BACS(options, type, target_node_id));
+                        }
+                        meta->table_type = table_type;
+                        meta->smallest.DecodeFrom(key);
+                    }
+                    builder->Add(key, iter->value());
+                    largest_cold_key.assign(key.data(), key.size());
                 }
             }
         }
 
-        if (s.ok()) {
-            //      assert(key.data()[0] == '0');
-            meta->largest.DecodeFrom(key);
-        } else {
-            delete builder;
+        if (!s.ok()) {
             return s;
+        }
+        if (builder != nullptr) {
+            meta->largest.DecodeFrom(Slice(largest_cold_key));
         }
 #ifndef NDEBUG
         printf("For flush, Total number of key touched is %d, KV left is %d\n", number_of_key, Not_drop_counter);
 #endif
         // Finish and check for builder errors
 
-        s = builder->Finish();
-        if (s.ok() && collect_hot_kv) {
+        if (builder != nullptr) {
+            s = builder->Finish();
+        }
+        if (s.ok() && has_hot_entries) {
             Status hot_status = hot_builder.Finish();
             if (!hot_status.ok()) {
                 s = hot_status;
             }
         }
-        builder->get_datablocks_map(meta->remote_data_mrs);
-        builder->get_dataindexblocks_map(meta->remote_dataindex_mrs);
-        builder->get_filter_map(meta->remote_filter_mrs);
 
         meta->file_size = 0;
-
-        for (auto iter : meta->remote_data_mrs) {
-            meta->file_size += iter.second->length;
+        if (builder != nullptr) {
+            builder->get_datablocks_map(meta->remote_data_mrs);
+            builder->get_dataindexblocks_map(meta->remote_dataindex_mrs);
+            builder->get_filter_map(meta->remote_filter_mrs);
+            for (auto data_mr : meta->remote_data_mrs) {
+                meta->file_size += data_mr.second->length;
+            }
+            meta->num_entries = builder->get_numentries();
+            DEBUG_arg("SSTable size is %lu \n", meta->file_size);
+            assert(builder->FileSize() == meta->file_size);
         }
-        meta->num_entries = builder->get_numentries();
-        DEBUG_arg("SSTable size is %lu \n", meta->file_size);
-        assert(builder->FileSize() == meta->file_size);
-        delete builder;
         // TOFIX: temporarily disable the verification of index block.
         // #ifndef NDEBUG
         //     sleep(10);
         // #endif
 
         // The index checking below is supposed
-        if (s.ok()) {
+        if (s.ok() && builder != nullptr) {
             // Verify that the table is usable
             Iterator* it = table_cache->NewIterator(ReadOptions(), meta);
             s = it->status();

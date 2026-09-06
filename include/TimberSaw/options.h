@@ -121,8 +121,12 @@ struct TimberSaw_EXPORT Options {
     // Also, a larger write buffer will result in a longer recovery time
     // the next time the database is opened.
     // before 64MB
-    // deprecated: This should be revised as number of key value per memtable.
     size_t write_buffer_size = 64 * 1024 * 1024;
+
+    // Maximum entries assigned to one memtable sequence range. Zero keeps
+    // the legacy default. Fixed-size workloads can derive this from
+    // write_buffer_size so normal writes honor the requested byte budget.
+    size_t memtable_max_entries = 0;
 #if TABLE_STRATEGY == 2
     size_t max_table_cache_size = 4 * 1024ull * 1024ull * 1024ull;  // in bytes 4GB default
 #else
@@ -194,6 +198,11 @@ struct TimberSaw_EXPORT Options {
     // default : 10
     int bloom_bits = 10;
 
+    // Disable only hot/cold classification and bucket migration while keeping
+    // the rest of the engine identical.  Used for an apples-to-apples SST-only
+    // baseline in the MixGraph benchmark.
+    bool enable_hot_cold = true;
+
     std::vector<std::pair<Slice, Slice>>* ShardInfo = nullptr;  // [Lower bound, upper bound)
 };
 
@@ -235,6 +244,10 @@ struct TimberSaw_EXPORT WriteOptions {
     // with sync==true has similar crash semantics to a "write()"
     // system call followed by "fsync()".
     bool sync = false;
+
+    // Benchmark/database initialization can opt out of training the runtime
+    // hotness detector. Normal user writes keep tracking enabled.
+    bool track_hotness = true;
 };
 
 }  // namespace TimberSaw

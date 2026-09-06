@@ -79,8 +79,8 @@ Status BucketTable::get(const Slice& key, unsigned& offset) {
     
     ibv_mr* local_mr = rdma_mg_->Get_local_read_mr();
     
-    int ret = rdma_mg_->RDMA_Read(&remote_mr, local_mr, SLOT_SIZE, 
-                                  "default", IBV_SEND_SIGNALED, 1, 0);
+    int ret = rdma_mg_->RDMA_Read(&remote_mr, local_mr, SLOT_SIZE,
+                                  "read_local", IBV_SEND_SIGNALED, 1, 0);
     
     if (ret != 0) {
         return Status::IOError("RDMA Read failed");

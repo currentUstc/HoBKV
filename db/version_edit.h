@@ -26,8 +26,9 @@ struct RemoteMemTableMetaData {
     RemoteMemTableMetaData(int side);
     // TOTHINK: the garbage collection of the Remote table is not triggered!
     ~RemoteMemTableMetaData();
-    bool Remote_blocks_deallocate(std::map<uint32_t, ibv_mr*> map, Chunk_type c_type) {
-        std::map<uint32_t, ibv_mr*>::iterator it;
+    template <typename Offset>
+    bool Remote_blocks_deallocate(std::map<Offset, ibv_mr*> map, Chunk_type c_type) {
+        typename std::map<Offset, ibv_mr*>::iterator it;
         //    assert(creator_node_id%2 == 0);
         for (it = map.begin(); it != map.end(); it++) {
             if (!rdma_mg->Deallocate_Remote_RDMA_Slot(it->second->addr, shard_target_node_id, c_type)) {
@@ -39,7 +40,6 @@ struct RemoteMemTableMetaData {
     }
     // TODO: sperate the deallocation buffer.
     bool Prepare_Batch_Deallocate() {
-        std::map<uint32_t, ibv_mr*>::iterator it;
         uint64_t* ptr_flush;
         uint64_t* ptr_filter;
         //    assert(remote_dataindex_mrs.size() == 1);
@@ -51,19 +51,19 @@ struct RemoteMemTableMetaData {
                                                                          shard_target_node_id, FilterChunk);
         size_t index_flush = 0;
         size_t index_filter = 0;
-        for (it = remote_data_mrs.begin(); it != remote_data_mrs.end(); it++) {
+        for (auto it = remote_data_mrs.begin(); it != remote_data_mrs.end(); it++) {
             ptr_flush[index_flush] = (uint64_t)it->second->addr;
             //      DEBUG_arg("deallocated data address is %p", ptr[index]);
             index_flush++;
             delete it->second;
         }
-        for (it = remote_dataindex_mrs.begin(); it != remote_dataindex_mrs.end(); it++) {
+        for (auto it = remote_dataindex_mrs.begin(); it != remote_dataindex_mrs.end(); it++) {
             ptr_flush[index_flush] = (uint64_t)it->second->addr;
             //      DEBUG_arg("deallocated data address is %p", ptr[index]);
             index_flush++;
             delete it->second;
         }
-        for (it = remote_filter_mrs.begin(); it != remote_filter_mrs.end(); it++) {
+        for (auto it = remote_filter_mrs.begin(); it != remote_filter_mrs.end(); it++) {
             ptr_filter[index_filter] = (uint64_t)it->second->addr;
             //      DEBUG_arg("deallocated data address is %p", ptr[index]);
             index_filter++;
@@ -79,8 +79,9 @@ struct RemoteMemTableMetaData {
         }
         return true;
     }
-    bool Local_blocks_deallocate(std::map<uint32_t, ibv_mr*> map) {
-        std::map<uint32_t, ibv_mr*>::iterator it;
+    template <typename Offset>
+    bool Local_blocks_deallocate(std::map<Offset, ibv_mr*> map) {
+        typename std::map<Offset, ibv_mr*>::iterator it;
 
         for (it = map.begin(); it != map.end(); it++) {
             //      if(!rdma_mg->Deallocate_Local_RDMA_Slot(it->second->addr, "FlushBuffer")){
@@ -104,8 +105,8 @@ struct RemoteMemTableMetaData {
     uint64_t allowed_seeks;  // Seeks allowed until compaction
     uint64_t number;
 
-    // The uint32_t is the offset within the file.
-    std::map<uint32_t, ibv_mr*> remote_data_mrs;
+    // Data offsets can exceed 4GB for large SSTs.
+    std::map<uint64_t, ibv_mr*> remote_data_mrs;
     std::map<uint32_t, ibv_mr*> remote_dataindex_mrs;
     std::map<uint32_t, ibv_mr*> remote_filter_mrs;
     // std::vector<ibv_mr*> remote_data_mrs

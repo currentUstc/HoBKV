@@ -99,7 +99,7 @@ public:
                               size_t& block_size) override;
     void FinishFilterBlock(FullFilterBlockBuilder* block, BlockHandle* handle, CompressionType compressiontype,
                            size_t& block_size) override;
-    void get_datablocks_map(std::map<uint32_t, ibv_mr*>& map) override;
+    void get_datablocks_map(std::map<uint64_t, ibv_mr*>& map) override;
     void get_dataindexblocks_map(std::map<uint32_t, ibv_mr*>& map) override;
     void get_filter_map(std::map<uint32_t, ibv_mr*>& map) override;
     size_t get_numentries() override;

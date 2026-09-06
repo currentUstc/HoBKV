@@ -7,7 +7,8 @@
 
 class RPC_Process {
 public:
-    virtual void persistence_unpin_handler(void* arg) = 0;
+    virtual void persistence_unpin_handler(void* arg) {}
+    virtual void bucket_meta_update_handler(void* request) = 0;
 };
 
 #endif  // TIMBERSAW_RPC_PROCESS_H

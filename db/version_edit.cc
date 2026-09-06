@@ -127,6 +127,10 @@ void RemoteMemTableMetaData::EncodeTo(std::string* dst) const {
     PutFixed64(dst, remote_data_chunk_num);
     PutFixed64(dst, remote_dataindex_chunk_num);
     PutFixed64(dst, remote_filter_chunk_num);
+    assert(remote_data_chunk_num > 0);
+    if (remote_data_chunk_num == 0) {
+        return;
+    }
     // Here we suppose all the remote memory chuck for the same table have similar infomation  below,
     //  the only difference is the addr and lenght
     // #ifndef NDEBUG
@@ -142,7 +146,7 @@ void RemoteMemTableMetaData::EncodeTo(std::string* dst) const {
     //  PutFixed32(dst, (uint32_t)remote_data_mrs.begin()->second->lkey);
     //  PutFixed32(dst, (uint32_t)remote_data_mrs.begin()->second->rkey);
     for (auto iter : remote_data_mrs) {
-        PutFixed32(dst, iter.first);
+        PutFixed64(dst, iter.first);
         mr_serialization(dst, iter.second);
     }
     for (auto iter : remote_dataindex_mrs) {
@@ -212,8 +216,8 @@ Status RemoteMemTableMetaData::DecodeFrom(Slice& src) {
                                 .handle = handle_temp,
                                 .lkey = lkey_temp,
                                 .rkey = rkey_temp};
-        uint32_t offset = 0;
-        GetFixed32(&src, &offset);
+        uint64_t offset = 0;
+        GetFixed64(&src, &offset);
         GetFixed64(&src, reinterpret_cast<uint64_t*>(&mr->addr));
         GetFixed64(&src, &mr->length);
         GetFixed32(&src, &mr->lkey);

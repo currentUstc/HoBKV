@@ -167,7 +167,9 @@ Iterator* Table_Memory_Side::BlockReader(void* arg, const ReadOptions& options, 
     if (s.ok()) {
         BlockContents contents;
         // The function below is correct, because the handle content the block without crc.
-        Find_Local_MR(&table->rep->remote_table->remote_data_mrs, handle, contents.data);
+        if (!Find_Local_MR(&table->rep->remote_table->remote_data_mrs, handle, contents.data)) {
+            return NewErrorIterator(Status::Corruption("data block outside local RDMA chunk"));
+        }
 
         // TODO: support compressed block.
         auto n = contents.data.size();
@@ -211,7 +213,6 @@ Iterator* Table_Memory_Side::BlockReader(void* arg, const ReadOptions& options, 
     }
 
     Iterator* iter;
-    iter = block->NewIterator(table->rep->options.comparator);
     if (block != nullptr) {
         iter = block->NewIterator(table->rep->options.comparator);
         iter->RegisterCleanup(&DeleteBlock, block, nullptr);
@@ -236,7 +237,9 @@ Slice Table_Memory_Side::KVReader(void* arg, const ReadOptions& options, const S
     assert(s.ok());
     Slice KV;
     // The function below is correct, because the handle content the block without crc.
-    Find_Local_MR(&table->rep->remote_table->remote_data_mrs, handle, KV);
+    if (!Find_Local_MR(&table->rep->remote_table->remote_data_mrs, handle, KV)) {
+        return Slice();
+    }
     return KV;
 }
 

@@ -5,6 +5,7 @@
 #include <numa.h>
 #include <numaif.h>
 #endif
+#include "db/db_impl.h"
 #include "db/table_cache.h"
 #include <algorithm>
 #include <array>
@@ -121,6 +122,9 @@ static int FLAGS_load_vs_num = 1;
 
 // Number of read operations to do.  If negative, do FLAGS_num reads.
 static int FLAGS_reads = -1;
+
+// Number of consecutive keys requested by each random range query.
+static int FLAGS_range_length = 64;
 
 // Per-thread MixGraph operations.  Kept separate from the post-run validation
 // read count so a long workload does not turn validation into another workload.
@@ -668,6 +672,9 @@ private:
     CountComparator count_comparator_;
     int total_thread_count_;
     std::vector<std::string> validation_keys;
+    std::atomic<uint64_t> range_scan_queries_{0};
+    std::atomic<uint64_t> range_scan_entries_{0};
+    std::atomic<uint64_t> range_scan_bucket_errors_{0};
     std::atomic<uint64_t> mixgraph_get_ops_{0};
     std::atomic<uint64_t> mixgraph_get_found_ops_{0};
     std::atomic<uint64_t> mixgraph_get_not_found_ops_{0};
@@ -1065,6 +1072,11 @@ private:
         if (method == &Benchmark::WriteRandom || method == &Benchmark::WriteRandomSharded) Validation_Write();
         const bool is_mixgraph_phase = method == &Benchmark::MixGraph || method == &Benchmark::PutMixGraph ||
                                        method == &Benchmark::GetMixGraph;
+        if (method == &Benchmark::RangeReadRandom) {
+            range_scan_queries_.store(0, std::memory_order_relaxed);
+            range_scan_entries_.store(0, std::memory_order_relaxed);
+            range_scan_bucket_errors_.store(0, std::memory_order_relaxed);
+        }
         if (is_mixgraph_phase) {
             mixgraph_get_ops_.store(0, std::memory_order_relaxed);
             mixgraph_get_found_ops_.store(0, std::memory_order_relaxed);
@@ -1223,6 +1235,15 @@ private:
                 std::printf("putmixgraph_inserted_keys: %llu\n",
                             static_cast<unsigned long long>(mixgraph_inserted_keys_.size()));
             }
+        }
+        if (method == &Benchmark::RangeReadRandom) {
+            std::printf("range_scan_summary: queries=%llu entries=%llu bucket_errors=%llu "
+                        "range_length=%d elapsed_us=%llu\n",
+                        static_cast<unsigned long long>(range_scan_queries_.load(std::memory_order_relaxed)),
+                        static_cast<unsigned long long>(range_scan_entries_.load(std::memory_order_relaxed)),
+                        static_cast<unsigned long long>(
+                            range_scan_bucket_errors_.load(std::memory_order_relaxed)),
+                        FLAGS_range_length, static_cast<unsigned long long>(benchmark_elapsed_us));
         }
         if (FLAGS_comparisons) {
             fprintf(stdout, "Comparisons: %zu\n", count_comparator_.comparisons());
@@ -1598,57 +1619,64 @@ private:
     }
     void RangeReadRandom(ThreadState* thread) {
         ReadOptions options;
-        // TODO(ruihong): specify the table_cache option.
-        std::string value;
-        int found = 0;
-        //    KeyBuffer key;
+        uint64_t found = 0;
+        uint64_t queries = 0;
+        uint64_t bucket_errors = 0;
         std::unique_ptr<const char[]> key_guard1;
         std::unique_ptr<const char[]> key_guard2;
         Slice key_start = AllocateKey(&key_guard1);
         Slice key_end = AllocateKey(&key_guard2);
-        int i = 0;
-        int range_length = 1000 * 1000;
-        char value_buff[FLAGS_value_size];
-        // #ifdef BYTEADDRESSABLE
-        //     Iterator* iter = db_->NewSEQIterator(options);
-        // #else
+        uint64_t completed_entries = 0;
+        const uint64_t key_space = static_cast<uint64_t>(FLAGS_num) * FLAGS_threads;
+        const uint64_t range_length = std::max<uint64_t>(1, std::min<uint64_t>(FLAGS_range_length, key_space));
         Iterator* iter = db_->NewIterator(options);
-        // #endif
-        while (i < reads_) {
-            //      const int k = thread->rand.Uniform(FLAGS_num*FLAGS_threads);// make it uniform as write.
-            int k_start = thread->rand.Next() % (FLAGS_num * FLAGS_threads - range_length);  // do not go out of bound
-            //      int k_end = thread->rand.Next()%(FLAGS_num*FLAGS_threads);
-            int k_end = k_start + range_length;
-            // TODO: directly use k_start + some value as k_end;
-            //      if (k_end < k_start){
-            //        int temp = k_start;
-            //        k_start = k_end;
-            //        k_end = temp;
-            //      }
-            //
-            //            key.Set(k);
-            GenerateKeyFromInt(k_start, &key_start);
-            GenerateKeyFromInt(k_end, &key_end);
-            //      if (db_->Get(options, key.slice(), &value).ok()) {
-            //        found++;
-            //      }
-
-            iter->Seek(key_start);
-            int move_forward_counter = 0;
-            // iter not valid after seek, why?
-            while (iter->key().compare(key_end) <= 0) {
-                memcpy(value_buff, iter->value().data(), FLAGS_value_size);
-
-                found++;
-                move_forward_counter++;
-                thread->stats.FinishedSingleOp();
-                iter->Next();
+        DBImpl* db_impl = static_cast<DBImpl*>(db_);
+        while (completed_entries < static_cast<uint64_t>(reads_)) {
+            const uint64_t entries_requested =
+                std::min<uint64_t>(range_length, static_cast<uint64_t>(reads_) - completed_entries);
+            const uint64_t max_start = key_space - entries_requested;
+            const uint64_t ordinal_start = max_start == 0 ? 0 : thread->rand.Next() % (max_start + 1);
+            const uint64_t ordinal_end = ordinal_start + entries_requested;
+            const uint64_t physical_start = MixGraphPhysicalKey(ordinal_start, key_space, key_start.size());
+            const uint64_t physical_end = MixGraphPhysicalKey(ordinal_end, key_space, key_end.size());
+            GenerateKeyFromInt(physical_start, &key_start);
+            GenerateKeyFromInt(physical_end, &key_end);
+            if (FLAGS_enable_hot_cold && db_impl != nullptr) {
+                uint64_t range_entries = 0;
+                uint64_t range_bytes = 0;
+                uint64_t range_bucket_errors = 0;
+                Status s = db_impl->ScanRangeWithBucketHelper(options, iter, key_start, key_end,
+                                                              &range_entries, &range_bytes,
+                                                              &range_bucket_errors);
+                if (!s.ok()) {
+                    std::fprintf(stderr, "range scan helper error: %s\n", s.ToString().c_str());
+                    std::exit(1);
+                }
+                found += range_entries;
+                bucket_errors += range_bucket_errors;
+                thread->stats.AddBytes(range_bytes);
+                for (uint64_t entry = 0; entry < range_entries; ++entry) {
+                    thread->stats.FinishedSingleOp();
+                }
+            } else {
+                iter->Seek(key_start);
+                while (iter->Valid() && iter->key().compare(key_end) < 0) {
+                    thread->stats.AddBytes(iter->key().size() + iter->value().size());
+                    found++;
+                    thread->stats.FinishedSingleOp();
+                    iter->Next();
+                }
             }
-
-            i = i + range_length;
+            completed_entries += entries_requested;
+            queries++;
         }
+        delete iter;
+        range_scan_queries_.fetch_add(queries, std::memory_order_relaxed);
+        range_scan_entries_.fetch_add(found, std::memory_order_relaxed);
+        range_scan_bucket_errors_.fetch_add(bucket_errors, std::memory_order_relaxed);
         char msg[100];
-        std::snprintf(msg, sizeof(msg), "(%d of %d found)", found, num_);
+        std::snprintf(msg, sizeof(msg), "(%llu entries in %llu ranges)",
+                      static_cast<unsigned long long>(found), static_cast<unsigned long long>(queries));
         thread->stats.AddMessage(msg);
     }
     void ReadRandom(ThreadState* thread) {
@@ -2301,6 +2329,8 @@ int main(int argc, char** argv) {
             FLAGS_mixgraph_ops = n;
         } else if (sscanf(argv[i], "--reads=%d%c", &n, &junk) == 1) {
             FLAGS_reads = n;
+        } else if (sscanf(argv[i], "--range_length=%d%c", &n, &junk) == 1 && n > 0) {
+            FLAGS_range_length = n;
         } else if (sscanf(argv[i], "--loads=%d%c", &n, &junk) == 1) {
             FLAGS_loads = n;
         } else if (sscanf(argv[i], "--load_vs_num=%d%c", &n, &junk) == 1) {

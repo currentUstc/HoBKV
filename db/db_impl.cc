@@ -24,6 +24,7 @@
 #include <fstream>
 #include <list>
 #include <limits>
+#include <map>
 #include <numa.h>
 #include <set>
 #include <string>
@@ -4157,6 +4158,144 @@ Iterator* DBImpl::NewIterator(const ReadOptions& options) {
         (options.snapshot != nullptr ? static_cast<const SnapshotImpl*>(options.snapshot)->sequence_number()
                                      : latest_snapshot),
         seed);
+}
+
+Status DBImpl::ScanRangeWithBucketHelper(const ReadOptions& options, Iterator* iter, const Slice& start,
+                                         const Slice& end, uint64_t* entry_count, uint64_t* byte_count,
+                                         uint64_t* bucket_error_count) {
+    if (iter == nullptr || entry_count == nullptr || byte_count == nullptr ||
+        bucket_error_count == nullptr) {
+        return Status::InvalidArgument("ScanRangeWithBucketHelper: output is null");
+    }
+    *entry_count = 0;
+    *byte_count = 0;
+    *bucket_error_count = 0;
+
+    std::map<std::string, size_t> merged_values;
+    for (iter->Seek(start); iter->Valid() && iter->key().compare(end) < 0; iter->Next()) {
+        merged_values[iter->key().ToString()] = iter->value().size();
+    }
+    if (!iter->status().ok()) {
+        return iter->status();
+    }
+
+    uint64_t start_key = 0;
+    uint64_t end_key = 0;
+    if (!start.TryGetIndex(&start_key) || !end.TryGetIndex(&end_key) || start_key >= end_key) {
+        return Status::InvalidArgument("ScanRangeWithBucketHelper: invalid numeric range");
+    }
+    if (env_ == nullptr || env_->rdma_mg == nullptr) {
+        return Status::IOError("ScanRangeWithBucketHelper: RDMA manager is null");
+    }
+
+    SequenceNumber max_sequence = options.snapshot != nullptr
+                                      ? static_cast<const SnapshotImpl*>(options.snapshot)->sequence_number()
+                                      : versions_->LastSequence();
+    std::shared_ptr<RDMA_Manager> rdma_mg = env_->rdma_mg;
+    uint64_t cursor = start_key;
+    while (cursor < end_key) {
+        ibv_mr send_mr = {};
+        ibv_mr receive_mr = {};
+        ibv_mr output_mr = {};
+        rdma_mg->Allocate_Local_RDMA_Slot(send_mr, Message);
+        rdma_mg->Allocate_Local_RDMA_Slot(receive_mr, Message);
+        rdma_mg->Allocate_Local_RDMA_Slot(output_mr, FlushBuffer);
+
+        RDMA_Request* request = reinterpret_cast<RDMA_Request*>(send_mr.addr);
+        *request = {};
+        request->command = bucket_scan;
+        request->content.bucket_scan.start_key = start_key;
+        request->content.bucket_scan.end_key = end_key;
+        request->content.bucket_scan.cursor_key = cursor;
+        request->content.bucket_scan.max_sequence = max_sequence;
+        request->content.bucket_scan.buffer_size = output_mr.length;
+        request->buffer = receive_mr.addr;
+        request->rkey = receive_mr.rkey;
+        request->buffer_large = output_mr.addr;
+        request->rkey_large = output_mr.rkey;
+
+        RDMA_Reply* reply = reinterpret_cast<RDMA_Reply*>(receive_mr.addr);
+        *reply = {};
+        asm volatile("sfence\n" : :);
+        asm volatile("lfence\n" : :);
+        asm volatile("mfence\n" : :);
+
+        Status request_status = Status::OK();
+        {
+            std::lock_guard<std::mutex> main_send_lock(rdma_mg->main_send_cq_mutex);
+            rdma_mg->post_send<RDMA_Request>(&send_mr, shard_target_node_id, std::string("main"));
+            ibv_wc wc[2] = {};
+            if (rdma_mg->poll_completion(wc, 1, std::string("main"), true, shard_target_node_id)) {
+                request_status = Status::IOError("ScanRangeWithBucketHelper: request send failed");
+            } else if (!rdma_mg->poll_reply_buffer(reply)) {
+                request_status = Status::IOError("ScanRangeWithBucketHelper: reply timeout");
+            }
+        }
+
+        *bucket_error_count += reply->content.bucket_scan.error_count;
+
+        if (request_status.ok()) {
+            const uint64_t payload_size = reply->content.bucket_scan.buffer_size;
+            const uint64_t expected_entries = reply->content.bucket_scan.entry_count;
+            if (payload_size > output_mr.length) {
+                request_status = Status::Corruption("ScanRangeWithBucketHelper: oversized reply");
+            } else {
+                Slice payload(static_cast<const char*>(output_mr.addr), payload_size);
+                uint64_t parsed_entries = 0;
+                while (request_status.ok() && !payload.empty()) {
+                    if (payload.size() < sizeof(uint64_t) * 5) {
+                        request_status = Status::Corruption("ScanRangeWithBucketHelper: truncated header");
+                        break;
+                    }
+                    const uint64_t key_index = DecodeFixed64(payload.data());
+                    const uint64_t sequence = DecodeFixed64(payload.data() + 8);
+                    const uint64_t raw_type = DecodeFixed64(payload.data() + 16);
+                    const uint64_t key_size = DecodeFixed64(payload.data() + 24);
+                    const uint64_t value_size = DecodeFixed64(payload.data() + 32);
+                    payload.remove_prefix(sizeof(uint64_t) * 5);
+                    if (key_index < start_key || key_index >= end_key || sequence > max_sequence ||
+                        key_size + value_size > payload.size()) {
+                        request_status = Status::Corruption("ScanRangeWithBucketHelper: invalid record");
+                        break;
+                    }
+                    std::string key(payload.data(), key_size);
+                    payload.remove_prefix(key_size);
+                    if (raw_type == 0) {
+                        merged_values[key] = value_size;
+                    } else {
+                        merged_values.erase(key);
+                    }
+                    payload.remove_prefix(value_size);
+                    ++parsed_entries;
+                }
+                if (request_status.ok() && parsed_entries != expected_entries) {
+                    request_status = Status::Corruption("ScanRangeWithBucketHelper: entry count mismatch");
+                }
+            }
+        }
+
+        const bool done = reply->content.bucket_scan.done != 0;
+        const uint64_t next_key = reply->content.bucket_scan.next_key;
+        rdma_mg->Deallocate_Local_RDMA_Slot(send_mr.addr, Message);
+        rdma_mg->Deallocate_Local_RDMA_Slot(receive_mr.addr, Message);
+        rdma_mg->Deallocate_Local_RDMA_Slot(output_mr.addr, FlushBuffer);
+        if (!request_status.ok()) {
+            return request_status;
+        }
+        if (done) {
+            break;
+        }
+        if (next_key <= cursor || next_key >= end_key) {
+            return Status::Corruption("ScanRangeWithBucketHelper: invalid continuation cursor");
+        }
+        cursor = next_key;
+    }
+
+    *entry_count = merged_values.size();
+    for (const auto& item : merged_values) {
+        *byte_count += item.first.size() + item.second;
+    }
+    return Status::OK();
 }
 // #ifdef BYTEADDRESSABLE
 // Iterator* DBImpl::NewSEQIterator(const ReadOptions& options) {

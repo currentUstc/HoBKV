@@ -99,6 +99,9 @@ public:
     Status Write(const WriteOptions& options, WriteBatch* updates) override;
     Status Get(const ReadOptions& options, const Slice& key, std::string* value) override;
     Iterator* NewIterator(const ReadOptions&) override;
+    Status ScanRangeWithBucketHelper(const ReadOptions& options, Iterator* iter, const Slice& start,
+                                     const Slice& end, uint64_t* entry_count, uint64_t* byte_count,
+                                     uint64_t* bucket_error_count);
     // #ifdef BYTEADDRESSABLE
     //   Iterator* NewSEQIterator(const ReadOptions&) override;
     // #endif

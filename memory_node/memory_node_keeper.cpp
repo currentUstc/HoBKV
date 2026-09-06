@@ -25,33 +25,53 @@ namespace TimberSaw {
 
 namespace {
 
-// 在单个 MR 上按 offset 解析 value zone 条目。
-bool TryExtractValueFromMR(const ibv_mr* mr, uint64_t offset_units, uint64_t expected_key_index,
-                           std::string* key, std::string* value, SequenceNumber* sequence,
-                           ValueType* value_type) {
-    if (mr == nullptr || mr->addr == nullptr || key == nullptr || value == nullptr ||
-        sequence == nullptr || value_type == nullptr) {
-        return false;
-    }
-    const uint64_t byte_offset = (offset_units * VALUE_ZONE_OFFSET_UNIT) % VALUE_ZONE_ALLOC_SIZE;
-    if (byte_offset + 48 > mr->length) {
+// Decode an entry by its logical value-zone offset.  An entry may cross a
+// 1 GB MR boundary, so assemble it from consecutive value-zone MRs first.
+bool TryExtractValueFromValueZone(const std::vector<ibv_mr*>& value_zone_mrs, uint64_t offset_units,
+                                  uint64_t expected_key_index, std::string* key, std::string* value,
+                                  SequenceNumber* sequence, ValueType* value_type) {
+    if (key == nullptr || value == nullptr || sequence == nullptr || value_type == nullptr) {
         return false;
     }
 
-    const char* base = static_cast<const char*>(mr->addr) + byte_offset;
-    const uint64_t total_size = DecodeFixed64(base);
+    auto copy_from_zone = [&value_zone_mrs](uint64_t byte_offset, char* dst, size_t size) {
+        size_t copied = 0;
+        while (copied < size) {
+            const size_t mr_index = byte_offset / VALUE_ZONE_ALLOC_SIZE;
+            const size_t offset_in_mr = byte_offset % VALUE_ZONE_ALLOC_SIZE;
+            if (mr_index >= value_zone_mrs.size()) {
+                return false;
+            }
+            const ibv_mr* mr = value_zone_mrs[mr_index];
+            if (mr == nullptr || mr->addr == nullptr || offset_in_mr >= mr->length) {
+                return false;
+            }
+            const size_t chunk = std::min(size - copied, mr->length - offset_in_mr);
+            std::memcpy(dst + copied, static_cast<const char*>(mr->addr) + offset_in_mr, chunk);
+            copied += chunk;
+            byte_offset += chunk;
+        }
+        return true;
+    };
+
+    const uint64_t byte_offset = offset_units * VALUE_ZONE_OFFSET_UNIT;
+    char header[48];
+    if (!copy_from_zone(byte_offset, header, sizeof(header))) {
+        return false;
+    }
+    const uint64_t total_size = DecodeFixed64(header);
     if (total_size < 56 || total_size > (64ull * 1024ull * 1024ull)) {
         return false;
     }
-    if (byte_offset + total_size > mr->length) {
+
+    std::string record(static_cast<size_t>(total_size), '\0');
+    if (!copy_from_zone(byte_offset, record.data(), record.size())) {
         return false;
     }
-
-    const uint64_t key_index = DecodeFixed64(base + 8);
-    if (key_index != expected_key_index) {
+    const char* base = record.data();
+    if (DecodeFixed64(base + 8) != expected_key_index) {
         return false;
     }
-
     const uint64_t raw_type = DecodeFixed64(base + 24);
     const uint64_t key_size = DecodeFixed64(base + 32);
     const uint64_t value_size = DecodeFixed64(base + 40);
@@ -61,27 +81,15 @@ bool TryExtractValueFromMR(const ibv_mr* mr, uint64_t offset_units, uint64_t exp
     const size_t padded_value_size =
         (static_cast<size_t>(value_size) + VALUE_ZONE_OFFSET_UNIT - 1) / VALUE_ZONE_OFFSET_UNIT *
         VALUE_ZONE_OFFSET_UNIT;
-    if (48 + padded_key_size + padded_value_size + 8 != total_size) {
+    const size_t raw_total_size = 48 + padded_key_size + padded_value_size + 8;
+    if (raw_total_size > record.size() || record.size() - raw_total_size >= VALUE_ZONE_OFFSET_UNIT) {
         return false;
     }
-
     key->assign(base + 48, static_cast<size_t>(key_size));
     value->assign(base + 48 + padded_key_size, static_cast<size_t>(value_size));
     *sequence = DecodeFixed64(base + 16);
     *value_type = raw_type == 0 ? kTypeValue : kTypeDeletion;
     return true;
-}
-
-// 在本地所有已注册 MR 中尝试定位 offset 对应条目。
-bool TryExtractValueFromLocalPools(const std::vector<ibv_mr*>& local_mem_pool, uint64_t offset_units,
-                                   uint64_t expected_key_index, std::string* key, std::string* value,
-                                   SequenceNumber* sequence, ValueType* value_type) {
-    for (const auto* mr : local_mem_pool) {
-        if (TryExtractValueFromMR(mr, offset_units, expected_key_index, key, value, sequence, value_type)) {
-            return true;
-        }
-    }
-    return false;
 }
 
 std::string BuildInternalKey(const std::string& user_key, SequenceNumber sequence, ValueType value_type) {
@@ -465,6 +473,11 @@ void Memory_Node_Keeper::RPC_Hot_To_Cold_Dispatch(void* thread_args) {
 void Memory_Node_Keeper::RPC_Cold_To_Hot_Dispatch(void* thread_args) {
     BGThreadMetadata* p = static_cast<BGThreadMetadata*>(thread_args);
     ((Memory_Node_Keeper*)p->db)->cold_to_hot_handler(p->func_args);
+    delete static_cast<BGThreadMetadata*>(thread_args);
+}
+void Memory_Node_Keeper::RPC_Bucket_Scan_Dispatch(void* thread_args) {
+    BGThreadMetadata* p = static_cast<BGThreadMetadata*>(thread_args);
+    ((Memory_Node_Keeper*)p->db)->bucket_scan_handler(p->func_args);
     delete static_cast<BGThreadMetadata*>(thread_args);
 }
 void Memory_Node_Keeper::Persistence_Dispatch(void* thread_args) {
@@ -1830,6 +1843,12 @@ void Memory_Node_Keeper::server_communication_thread(std::string client_ip, int 
                 .request = receive_msg_buf, .client_ip = client_ip, .target_node_id = compute_node_id};
             BGThreadMetadata* thread_pool_args = new BGThreadMetadata{.db = this, .func_args = argforhandler};
             Message_handler_pool_.Schedule(&Memory_Node_Keeper::RPC_Cold_To_Hot_Dispatch, thread_pool_args);
+        } else if (receive_msg_buf->command == bucket_scan) {
+            rdma_mg->post_receive<RDMA_Request>(&recv_mr[buffer_position], compute_node_id, client_ip);
+            Arg_for_handler* argforhandler = new Arg_for_handler{
+                .request = receive_msg_buf, .client_ip = client_ip, .target_node_id = compute_node_id};
+            BGThreadMetadata* thread_pool_args = new BGThreadMetadata{.db = this, .func_args = argforhandler};
+            Message_handler_pool_.Schedule(&Memory_Node_Keeper::RPC_Bucket_Scan_Dispatch, thread_pool_args);
         } else if (receive_msg_buf->command == version_unpin_) {
             rdma_mg->post_receive<RDMA_Request>(&recv_mr[buffer_position], compute_node_id, client_ip);
             version_unpin_handler(receive_msg_buf, client_ip);
@@ -1961,17 +1980,20 @@ void Memory_Node_Keeper::create_mr_handler(RDMA_Request* request, std::string& c
     ibv_mr send_mr;
     rdma_mg->Allocate_Local_RDMA_Slot(send_mr, Message);
     RDMA_Reply* send_pointer = (RDMA_Reply*)send_mr.addr;
+    *send_pointer = {};
 
+    const size_t requested_size = request->content.create_mr.mem_size;
+    const Chunk_type requested_type = request->content.create_mr.c_type;
     ibv_mr* mr = nullptr;
     char* buff;
 #if defined(WITHPERSISTENCE) && defined(BOUNDEDMEM)
     {
         std::unique_lock<std::shared_mutex> lck(rdma_mg->local_mem_mutex);
-        assert(request->content.mem_size = 1024 * 1024 * 1024);  // Preallocation requrie memory is 1GB
+        assert(requested_size == 1024 * 1024 * 1024);  // Preallocation requires memory in 1GB units.
         if (!rdma_mg->pre_allocated_pool.empty()) {
-            if (!rdma_mg->Local_Memory_Register(&buff, &mr, request->content.mem_size, No_Use_Default_chunk)) {
+            if (!rdma_mg->Local_Memory_Register(&buff, &mr, requested_size, No_Use_Default_chunk)) {
                 fprintf(stderr, "memory registering failed by size of 0x%x\n",
-                        static_cast<unsigned>(request->content.mem_size));
+                        static_cast<unsigned>(requested_size));
             }
             send_pointer->content.mr = *mr;
         } else {
@@ -1987,10 +2009,10 @@ void Memory_Node_Keeper::create_mr_handler(RDMA_Request* request, std::string& c
 #else
     {
         std::unique_lock<std::shared_mutex> lck(rdma_mg->local_mem_mutex);
-        assert(request->content.mem_size = 1024 * 1024 * 1024);  // Preallocation requrie memory is 1GB
-        if (!rdma_mg->Local_Memory_Register(&buff, &mr, request->content.mem_size, No_Use_Default_chunk)) {
+        assert(requested_size == 1024 * 1024 * 1024);  // Preallocation requires memory in 1GB units.
+        if (!rdma_mg->Local_Memory_Register(&buff, &mr, requested_size, No_Use_Default_chunk)) {
             fprintf(stderr, "memory registering failed by size of 0x%x\n",
-                    static_cast<unsigned>(request->content.mem_size));
+                    static_cast<unsigned>(requested_size));
         }
         //      printf("Now the Remote memory regularated by compute node is %zu GB",
         //             rdma_mg->local_mem_pool.size());
@@ -1999,6 +2021,11 @@ void Memory_Node_Keeper::create_mr_handler(RDMA_Request* request, std::string& c
     send_pointer->content.mr = *mr;
     send_pointer->received = true;
 #endif
+
+    if (mr != nullptr && requested_type == ValueZoneChunk) {
+        std::lock_guard<std::mutex> lock(value_zone_mr_mu_);
+        value_zone_mrs_.push_back(mr);
+    }
 
     rdma_mg->RDMA_Write(request->buffer, request->rkey, &send_mr, sizeof(RDMA_Reply), client_ip, IBV_SEND_SIGNALED, 1,
                         target_node_id);
@@ -2432,6 +2459,121 @@ void Memory_Node_Keeper::flush_helper_handler(void* arg) {
     delete (Arg_for_handler*)arg;
 }
 
+// Assemble the latest bucket/value-zone records for one key range on the
+// memory node and return them in an 8 MB RDMA batch. The cursor allows a
+// caller to fetch a large range in a small number of round trips.
+void Memory_Node_Keeper::bucket_scan_handler(void* arg) {
+    RDMA_Request* request = ((Arg_for_handler*)arg)->request;
+    const std::string client_ip = ((Arg_for_handler*)arg)->client_ip;
+    const uint8_t target_node_id = ((Arg_for_handler*)arg)->target_node_id;
+    const bucket_scan_request scan = request->content.bucket_scan;
+
+    struct ScanItem {
+        uint64_t key_index;
+        std::string key;
+        std::string value;
+        SequenceNumber sequence;
+        ValueType value_type;
+    };
+    std::vector<ScanItem> items;
+    uint64_t error_count = 0;
+    std::vector<ibv_mr*> value_zone_mrs;
+    {
+        std::lock_guard<std::mutex> lock(value_zone_mr_mu_);
+        value_zone_mrs = value_zone_mrs_;
+    }
+
+    if (scan.start_key < scan.end_key && scan.cursor_key < scan.end_key) {
+        std::lock_guard<std::mutex> update_lock(bucket_update_mu_);
+        for (const auto& key_sequence : latest_bucket_sequence_by_key_) {
+            const uint64_t key_index = key_sequence.first;
+            if (key_index < std::max(scan.start_key, scan.cursor_key) || key_index >= scan.end_key ||
+                key_sequence.second > scan.max_sequence) {
+                continue;
+            }
+            const uint64_t bucket_idx = key_index / SLOT_NUM_PER_BUCKET;
+            const uint64_t slot_idx = key_index % SLOT_NUM_PER_BUCKET;
+            auto builder = GetBucketTableBuilder(bucket_idx);
+            uint64_t offset_units = 0;
+            if (!builder || !builder->ReadSlot(slot_idx, &offset_units).ok() || offset_units == 0) {
+                ++error_count;
+                continue;
+            }
+
+            std::string key;
+            std::string value;
+            SequenceNumber sequence = 0;
+            ValueType value_type = kTypeValue;
+            if (!TryExtractValueFromValueZone(value_zone_mrs, offset_units, key_index,
+                                              &key, &value, &sequence, &value_type)) {
+                ++error_count;
+                continue;
+            }
+            if (sequence <= scan.max_sequence) {
+                items.push_back({key_index, std::move(key), std::move(value), sequence, value_type});
+            }
+        }
+    }
+
+    std::sort(items.begin(), items.end(), [](const ScanItem& lhs, const ScanItem& rhs) {
+        return lhs.key_index < rhs.key_index;
+    });
+
+    ibv_mr output_mr = {};
+    rdma_mg->Allocate_Local_RDMA_Slot(output_mr, FlushBuffer);
+    const size_t capacity = std::min<size_t>(scan.buffer_size, output_mr.length);
+    std::string output;
+    output.reserve(capacity);
+    size_t consumed = 0;
+    size_t emitted = 0;
+    for (; consumed < items.size(); ++consumed) {
+        const ScanItem& item = items[consumed];
+        const size_t record_size = sizeof(uint64_t) * 5 + item.key.size() + item.value.size();
+        if (record_size > capacity) {
+            ++error_count;
+            if (output.empty()) {
+                ++consumed;
+            }
+            break;
+        }
+        if (output.size() + record_size > capacity) {
+            break;
+        }
+        PutFixed64(&output, item.key_index);
+        PutFixed64(&output, item.sequence);
+        PutFixed64(&output, item.value_type == kTypeDeletion ? 1 : 0);
+        PutFixed64(&output, item.key.size());
+        PutFixed64(&output, item.value.size());
+        output.append(item.key);
+        output.append(item.value);
+        ++emitted;
+    }
+
+    if (!output.empty()) {
+        std::memcpy(output_mr.addr, output.data(), output.size());
+        rdma_mg->RDMA_Write(request->buffer_large, request->rkey_large, &output_mr, output.size(),
+                            client_ip, IBV_SEND_SIGNALED, 1, target_node_id);
+    }
+
+    ibv_mr send_mr = {};
+    rdma_mg->Allocate_Local_RDMA_Slot(send_mr, Message);
+    RDMA_Reply* reply = reinterpret_cast<RDMA_Reply*>(send_mr.addr);
+    *reply = {};
+    reply->content.bucket_scan.buffer_size = output.size();
+    reply->content.bucket_scan.entry_count = emitted;
+    reply->content.bucket_scan.next_key = consumed < items.size() ? items[consumed].key_index : scan.end_key;
+    reply->content.bucket_scan.error_count = error_count;
+    reply->content.bucket_scan.done = consumed >= items.size();
+    reply->received = true;
+    rdma_mg->RDMA_Write(request->buffer, request->rkey, &send_mr, sizeof(RDMA_Reply),
+                        client_ip, IBV_SEND_SIGNALED, 1, target_node_id);
+
+    rdma_mg->Deallocate_Local_RDMA_Slot(send_mr.addr, Message);
+    rdma_mg->Deallocate_Local_RDMA_Slot(output_mr.addr, FlushBuffer);
+    delete request;
+    delete (Arg_for_handler*)arg;
+}
+
 // 处理 hot_to_cold 请求：根据 shard_idx 映射单个 bucket 并启动后台线程构建新 SST。
 void Memory_Node_Keeper::hot_to_cold_handler(void* arg) {
     RDMA_Request* request = ((Arg_for_handler*)arg)->request;
@@ -2545,6 +2687,11 @@ Status Memory_Node_Keeper::hot_to_cold_worker(uint64_t shard_idx, uint64_t bucke
     };
 
     std::vector<KVItem> kv_items;
+    std::vector<ibv_mr*> value_zone_mrs;
+    {
+        std::lock_guard<std::mutex> lock(value_zone_mr_mu_);
+        value_zone_mrs = value_zone_mrs_;
+    }
     std::lock_guard<std::mutex> update_lock(bucket_update_mu_);
     auto builder = GetBucketTableBuilder(bucket_idx);
     if (builder) {
@@ -2561,8 +2708,8 @@ Status Memory_Node_Keeper::hot_to_cold_worker(uint64_t shard_idx, uint64_t bucke
             std::string value;
             SequenceNumber sequence = 0;
             ValueType value_type = kTypeValue;
-            if (!TryExtractValueFromLocalPools(rdma_mg->local_mem_pool, offset_units, key_index,
-                                               &key, &value, &sequence, &value_type)) {
+            if (!TryExtractValueFromValueZone(value_zone_mrs, offset_units, key_index,
+                                              &key, &value, &sequence, &value_type)) {
                 continue;
             }
             kv_items.push_back({key_index, std::move(key), std::move(value), sequence, value_type});

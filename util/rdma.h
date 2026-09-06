@@ -154,6 +154,20 @@ struct bucket_meta_update_request {
     uint32_t subrange_count;
     uint8_t subrange_bitmap[kBucketMetaBitmapMax];
 } __attribute__((packed));
+struct bucket_scan_request {
+    uint64_t start_key;
+    uint64_t end_key;  // exclusive
+    uint64_t cursor_key;
+    uint64_t max_sequence;
+    uint64_t buffer_size;
+} __attribute__((packed));
+struct bucket_scan_reply {
+    uint64_t buffer_size;
+    uint64_t entry_count;
+    uint64_t next_key;
+    uint64_t error_count;
+    uint8_t done;
+} __attribute__((packed));
 enum RDMA_Command_Type {
     invalid_command_,
     create_qp_,
@@ -176,7 +190,8 @@ enum RDMA_Command_Type {
     flush_helper,
     hot_to_cold,
     cold_to_hot,
-    bucket_meta_update
+    bucket_meta_update,
+    bucket_scan
 };
 enum file_type { log_type, others };
 struct fs_sync_command {
@@ -192,12 +207,17 @@ struct CPU_Info {
     double cpu_util;
     int core_number;
 };
+struct create_mr_request {
+    size_t mem_size;
+    Chunk_type c_type;
+};
 
 // TODO (ruihong): add the reply message address to avoid request&response conflict for the same queue pair.
 //  In other word, the threads will not need to figure out whether this message is a reply or response,
 //  when receive a message from the main queue pair.
 union RDMA_Request_Content {
     size_t mem_size;
+    create_mr_request create_mr;
     registered_qp_config qp_config;
     fs_sync_command fs_sync_cmd;
     install_versionedit ive;
@@ -210,12 +230,14 @@ union RDMA_Request_Content {
     hot_to_cold_request hot_to_cold;
     cold_to_hot_request cold_to_hot;
     bucket_meta_update_request bucket_meta_update;
+    bucket_scan_request bucket_scan;
 };
 union RDMA_Reply_Content {
     ibv_mr mr;
     registered_qp_config qp_config;
     install_versionedit ive;
     uint64_t error_count;
+    bucket_scan_reply bucket_scan;
     //  long double cpu_percent;
     CPU_Info cpu_info;
 };

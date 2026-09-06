@@ -46,6 +46,7 @@ public:
     static void RPC_Flush_Helper_Dispatch(void* thread_args);
     static void RPC_Hot_To_Cold_Dispatch(void* thread_args);
     static void RPC_Cold_To_Hot_Dispatch(void* thread_args);
+    static void RPC_Bucket_Scan_Dispatch(void* thread_args);
     static void Persistence_Dispatch(void* thread_args);
     //  void BackgroundCompaction(void* p);
     void CleanupCompaction(CompactionState* compact);
@@ -193,6 +194,7 @@ private:
     Status hot_to_cold_worker(uint64_t shard_idx, uint64_t bucket_idx, std::string client_ip,
                               uint8_t target_node_id);
     void cold_to_hot_handler(void* arg);
+    void bucket_scan_handler(void* arg);
 
     void qp_reset_handler(RDMA_Request* request, std::string& client_ip, int socket_fd, uint8_t target_node_id);
     void sync_option_handler(RDMA_Request* request, std::string& client_ip, uint8_t target_node_id);
@@ -221,6 +223,8 @@ private:
 
     std::mutex bucket_table_mu_;
     std::mutex bucket_update_mu_;
+    std::mutex value_zone_mr_mu_;
+    std::vector<ibv_mr*> value_zone_mrs_;
     std::unordered_map<uint64_t, std::shared_ptr<BucketTableBuilderMemorySide>> bucket_table_builders_;
     std::unordered_map<uint64_t, ibv_mr> bucket_table_mrs_;
     std::unordered_map<uint64_t, SequenceNumber> latest_bucket_sequence_by_key_;

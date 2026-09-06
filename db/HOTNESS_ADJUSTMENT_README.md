@@ -102,8 +102,8 @@ new_access_count = old_access_count * decay_factor
 系统会在冷热状态变化时调用以下回调：
 
 ```cpp
-void DBImpl::Hot2Cold(size_t shard_idx);  // 热 → 冷
-void DBImpl::Cold2Hot(size_t shard_idx);  // 冷 → 热
+Status DBImpl::Hot2Cold(size_t shard_idx);  // 热 → 冷
+Status DBImpl::Cold2Hot(size_t shard_idx);  // 冷 → 热
 ```
 
 参数 `shard_idx` 是发生变化的 key range shard 索引。

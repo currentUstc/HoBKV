@@ -5,6 +5,7 @@
 #include "db/db_impl.h"
 
 #include "db/builder.h"
+#include "db/bucket/bucket_table_builder.h"
 #include "db/db_impl_sharding.h"
 #include "db/db_iter.h"
 #include "db/dbformat.h"
@@ -3208,13 +3209,19 @@ bool DBImpl::ShouldReadSSTForKey(const Slice& user_key, size_t shard_idx, Sequen
     std::lock_guard<std::mutex> lock(bucket_meta_mu_);
     auto it = bucket_migration_meta_by_shard_.find(shard_idx);
     if (it == bucket_migration_meta_by_shard_.end()) {
+        if (cutover_sequence != nullptr) {
+            *cutover_sequence = kMaxSequenceNumber;
+        }
         return true;
     }
     const BucketMigrationMeta& meta = it->second;
     if (cutover_sequence != nullptr) {
         *cutover_sequence = meta.cutover_sequence;
     }
-    const uint64_t key_index = static_cast<uint64_t>(user_key.Index());
+    uint64_t key_index = 0;
+    if (!user_key.TryGetIndex(&key_index)) {
+        return true;
+    }
     if (meta.max_key <= meta.min_key || key_index < meta.min_key || key_index >= meta.max_key ||
         meta.subrange_bitmap.empty()) {
         return true;
@@ -3233,7 +3240,7 @@ bool DBImpl::ShouldReadSSTForKey(const Slice& user_key, size_t shard_idx, Sequen
 }
 
 bool DBImpl::TryGetValueFromBucket(size_t shard_idx, const Slice& user_key, std::string* value, SequenceNumber* seq,
-                                   Status* status) {
+                                   bool* is_deletion, Status* status) {
     if (value == nullptr || status == nullptr || bucket_table_handler_ == nullptr || value_zone_ == nullptr) {
         return false;
     }
@@ -3247,7 +3254,8 @@ bool DBImpl::TryGetValueFromBucket(size_t shard_idx, const Slice& user_key, std:
 
     Slice bucket_value;
     uint64_t seq_raw = 0;
-    Status zone_status = value_zone_->GetWithSequence(offset_units, bucket_value, &seq_raw);
+    bool bucket_deletion = false;
+    Status zone_status = value_zone_->GetWithSequence(offset_units, bucket_value, &seq_raw, &bucket_deletion);
     if (!zone_status.ok()) {
         *status = zone_status;
         return false;
@@ -3256,6 +3264,9 @@ bool DBImpl::TryGetValueFromBucket(size_t shard_idx, const Slice& user_key, std:
     value->assign(bucket_value.data(), bucket_value.size());
     if (seq != nullptr) {
         *seq = static_cast<SequenceNumber>(seq_raw);
+    }
+    if (is_deletion != nullptr) {
+        *is_deletion = bucket_deletion;
     }
     if (bucket_value.data() != nullptr) {
         delete[] const_cast<char*>(bucket_value.data());
@@ -4052,22 +4063,17 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key, std::string* va
             bool read_sst = true;
             SequenceNumber cutover_sequence = 0;
             size_t shard_idx = 0;
-            if (shard_config_.KV_shards > 0 && max_key_range_ > 0) {
-                const uint64_t key_index = static_cast<uint64_t>(key.Index());
-                const uint64_t shard_size = max_key_range_ / shard_config_.KV_shards;
-                shard_idx = shard_size > 0 ? static_cast<size_t>(key_index / shard_size) : 0;
-                if (shard_idx >= shard_config_.KV_shards) {
-                    shard_idx = shard_config_.KV_shards - 1;
-                }
+            if (GetShardIndexForKey(key, &shard_idx)) {
                 read_sst = ShouldReadSSTForKey(key, shard_idx, &cutover_sequence);
             }
 
             Status bucket_status;
             SequenceNumber bucket_seq = 0;
-            if (TryGetValueFromBucket(shard_idx, key, value, &bucket_seq, &bucket_status)) {
+            bool bucket_deletion = false;
+            if (TryGetValueFromBucket(shard_idx, key, value, &bucket_seq, &bucket_deletion, &bucket_status)) {
                 // bucket-only: 不读 SST；migrating: 若 bucket 版本已跨过 cutover，也不读 SST。
-                if (!read_sst || bucket_seq > cutover_sequence) {
-                    s = Status::OK();
+                if (bucket_seq <= snapshot && (!read_sst || bucket_seq > cutover_sequence)) {
+                    s = bucket_deletion ? Status::NotFound("deleted in hot bucket") : Status::OK();
                 } else {
                     s = current->Get(options, lkey, value, &stats);
                 }
@@ -4132,6 +4138,22 @@ void DBImpl::ReleaseSnapshot(const Snapshot* snapshot) {
 }
 
 // 记录单次访问并累加分区统计，必要时触发热度调整调度
+bool DBImpl::GetShardIndexForKey(const Slice& key, size_t* shard_idx) const {
+    if (shard_idx == nullptr || shard_config_.KV_shards == 0 || max_key_range_ == 0) {
+        return false;
+    }
+    uint64_t key_index = 0;
+    if (!key.TryGetIndex(&key_index) || key_index >= max_key_range_) {
+        return false;
+    }
+    const uint64_t shard_size = max_key_range_ / shard_config_.KV_shards;
+    *shard_idx = shard_size > 0 ? static_cast<size_t>(key_index / shard_size) : 0;
+    if (*shard_idx >= shard_config_.KV_shards) {
+        *shard_idx = shard_config_.KV_shards - 1;
+    }
+    return true;
+}
+
 void DBImpl::RecordKeyAccess(const Slice& key, bool is_write) {
     if (key_range_hot_stats_.empty() || max_key_range_ == 0) {
         return;
@@ -4141,19 +4163,9 @@ void DBImpl::RecordKeyAccess(const Slice& key, bool is_write) {
         return;
     }
     
-    // 使用 Slice::Index() 获取 key 对应的整数值
-    unsigned long long key_index = key.Index();
-    
-    // 确保 key_index 在有效范围内
-    if (key_index >= max_key_range_) {
+    size_t shard_idx = 0;
+    if (!GetShardIndexForKey(key, &shard_idx)) {
         return;
-    }
-    
-    unsigned long long shard_size = max_key_range_ / shard_config_.KV_shards;
-    size_t shard_idx = (shard_size > 0) ? (key_index / shard_size) : 0;
-    
-    if (shard_idx >= key_range_hot_stats_.size()) {
-        shard_idx = key_range_hot_stats_.size() - 1;
     }
     
     KeyRangeHotStats& stats = key_range_hot_stats_[shard_idx];
@@ -4174,15 +4186,9 @@ bool DBImpl::IsHotKey(const Slice& user_key) {
         return false;
     }
 
-    unsigned long long key_index = user_key.Index();
-    if (key_index >= max_key_range_) {
+    size_t shard_idx = 0;
+    if (!GetShardIndexForKey(user_key, &shard_idx)) {
         return false;
-    }
-
-    unsigned long long shard_size = max_key_range_ / shard_config_.KV_shards;
-    size_t shard_idx = (shard_size > 0) ? (key_index / shard_size) : 0;
-    if (shard_idx >= key_range_hot_stats_.size()) {
-        shard_idx = key_range_hot_stats_.size() - 1;
     }
 
     std::lock_guard<std::mutex> lock(hot_stats_mutex_);
@@ -4269,8 +4275,13 @@ void DBImpl::AdjustHotColdRegions() {
     }
     
     for (size_t shard_idx : to_cool) {
+        Status transition_status = Hot2Cold(shard_idx);
+        if (!transition_status.ok()) {
+            std::fprintf(stderr, "Shard %zu: Hot -> Cold failed: %s\n", shard_idx,
+                         transition_status.ToString().c_str());
+            continue;
+        }
         hot_region_lru_.remove(shard_idx);
-        Hot2Cold(shard_idx);
         key_range_hot_stats_[shard_idx].ishot = false;
         hot_region_set_.erase(shard_idx);
         printf("Shard %zu: Hot -> Cold (access: %lu, score: %.2f)\\n",
@@ -4283,8 +4294,13 @@ void DBImpl::AdjustHotColdRegions() {
         // 如果已经达到最大热区域数，使用 LRU 移除最久未使用的
         if (hot_region_lru_.size() >= shard_config_.max_bucket_tables) {
             size_t lru_shard = hot_region_lru_.back();
+            Status transition_status = Hot2Cold(lru_shard);
+            if (!transition_status.ok()) {
+                std::fprintf(stderr, "Shard %zu: LRU Hot -> Cold failed: %s\n", lru_shard,
+                             transition_status.ToString().c_str());
+                continue;
+            }
             hot_region_lru_.pop_back();
-            Hot2Cold(lru_shard);  // 调用用户提供的回调
             key_range_hot_stats_[lru_shard].ishot = false;
             hot_region_set_.erase(lru_shard);
             printf("Shard %zu: Hot -> Cold (LRU eviction, access: %lu, score: %.2f)\\n",
@@ -4293,8 +4309,13 @@ void DBImpl::AdjustHotColdRegions() {
                    key_range_hot_stats_[lru_shard].hotness_score);
         }
         
+        Status transition_status = Cold2Hot(shard_idx);
+        if (!transition_status.ok()) {
+            std::fprintf(stderr, "Shard %zu: Cold -> Hot failed: %s\n", shard_idx,
+                         transition_status.ToString().c_str());
+            continue;
+        }
         hot_region_lru_.push_front(shard_idx);
-        Cold2Hot(shard_idx);
         key_range_hot_stats_[shard_idx].ishot = true;
         hot_region_set_.insert(shard_idx);
         printf("Shard %zu: Cold -> Hot (access: %lu, score: %.2f)\\n",
@@ -4387,9 +4408,9 @@ void DBImpl::BackgroundHotnessAdjustment() {
 }
 
 // 计算侧发送 hot_to_cold 消息到内存侧，并等待确认回包。
-void DBImpl::Hot2Cold(size_t shard_idx) {
+Status DBImpl::Hot2Cold(size_t shard_idx) {
     if (env_ == nullptr || env_->rdma_mg == nullptr) {
-        return;
+        return Status::IOError("Hot2Cold: RDMA manager is null");
     }
 
     std::shared_ptr<RDMA_Manager> rdma_mg = env_->rdma_mg;
@@ -4419,14 +4440,19 @@ void DBImpl::Hot2Cold(size_t shard_idx) {
         std::fprintf(stderr, "Hot2Cold: failed to send hot_to_cold request, shard=%zu\n", shard_idx);
         rdma_mg->Deallocate_Local_RDMA_Slot(send_mr.addr, Message);
         rdma_mg->Deallocate_Local_RDMA_Slot(receive_mr.addr, Message);
-        return;
+        return Status::IOError("Hot2Cold: send failed");
     }
 
     if (!rdma_mg->poll_reply_buffer(receive_pointer)) {
         std::fprintf(stderr, "Hot2Cold: timeout waiting reply, shard=%zu\n", shard_idx);
         rdma_mg->Deallocate_Local_RDMA_Slot(send_mr.addr, Message);
         rdma_mg->Deallocate_Local_RDMA_Slot(receive_mr.addr, Message);
-        return;
+        return Status::IOError("Hot2Cold: reply timeout");
+    }
+    if (receive_pointer->content.error_count != 0) {
+        rdma_mg->Deallocate_Local_RDMA_Slot(send_mr.addr, Message);
+        rdma_mg->Deallocate_Local_RDMA_Slot(receive_mr.addr, Message);
+        return Status::IOError("Hot2Cold: memory-side transition failed");
     }
     {
         std::lock_guard<std::mutex> lock(bucket_meta_mu_);
@@ -4435,12 +4461,13 @@ void DBImpl::Hot2Cold(size_t shard_idx) {
 
     rdma_mg->Deallocate_Local_RDMA_Slot(send_mr.addr, Message);
     rdma_mg->Deallocate_Local_RDMA_Slot(receive_mr.addr, Message);
+    return Status::OK();
 }
 
 // 冷转热的占位实现。
-void DBImpl::Cold2Hot(size_t shard_idx) {
+Status DBImpl::Cold2Hot(size_t shard_idx) {
     if (env_ == nullptr || env_->rdma_mg == nullptr) {
-        return;
+        return Status::IOError("Cold2Hot: RDMA manager is null");
     }
 
     std::shared_ptr<RDMA_Manager> rdma_mg = env_->rdma_mg;
@@ -4455,7 +4482,7 @@ void DBImpl::Cold2Hot(size_t shard_idx) {
                      alloc_status.ToString().c_str());
         rdma_mg->Deallocate_Local_RDMA_Slot(send_mr.addr, Message);
         rdma_mg->Deallocate_Local_RDMA_Slot(receive_mr.addr, Message);
-        return;
+        return alloc_status;
     }
 
     ibv_mr bucket_mr = {};
@@ -4465,7 +4492,7 @@ void DBImpl::Cold2Hot(size_t shard_idx) {
                      mr_status.ToString().c_str());
         rdma_mg->Deallocate_Local_RDMA_Slot(send_mr.addr, Message);
         rdma_mg->Deallocate_Local_RDMA_Slot(receive_mr.addr, Message);
-        return;
+        return mr_status;
     }
 
     uint64_t min_key = 0;
@@ -4498,14 +4525,19 @@ void DBImpl::Cold2Hot(size_t shard_idx) {
         std::fprintf(stderr, "Cold2Hot: failed to send cold_to_hot request, shard=%zu\n", shard_idx);
         rdma_mg->Deallocate_Local_RDMA_Slot(send_mr.addr, Message);
         rdma_mg->Deallocate_Local_RDMA_Slot(receive_mr.addr, Message);
-        return;
+        return Status::IOError("Cold2Hot: send failed");
     }
 
     if (!rdma_mg->poll_reply_buffer(receive_pointer)) {
         std::fprintf(stderr, "Cold2Hot: timeout waiting reply, shard=%zu\n", shard_idx);
         rdma_mg->Deallocate_Local_RDMA_Slot(send_mr.addr, Message);
         rdma_mg->Deallocate_Local_RDMA_Slot(receive_mr.addr, Message);
-        return;
+        return Status::IOError("Cold2Hot: reply timeout");
+    }
+    if (receive_pointer->content.error_count != 0) {
+        rdma_mg->Deallocate_Local_RDMA_Slot(send_mr.addr, Message);
+        rdma_mg->Deallocate_Local_RDMA_Slot(receive_mr.addr, Message);
+        return Status::IOError("Cold2Hot: memory-side transition failed");
     }
 
     if (value_zone_ == nullptr) {
@@ -4514,15 +4546,39 @@ void DBImpl::Cold2Hot(size_t shard_idx) {
 
     rdma_mg->Deallocate_Local_RDMA_Slot(send_mr.addr, Message);
     rdma_mg->Deallocate_Local_RDMA_Slot(receive_mr.addr, Message);
+    return Status::OK();
+}
+
+void DBImpl::DisableBucketOnlyReads(size_t shard_idx) {
+    std::lock_guard<std::mutex> lock(bucket_meta_mu_);
+    bucket_migration_meta_by_shard_.erase(shard_idx);
+}
+
+Status DBImpl::ApplyHotWrite(const Slice& key, const Slice& value, SequenceNumber sequence, bool is_deletion) {
+    size_t shard_idx = 0;
+    if (!GetShardIndexForKey(key, &shard_idx)) {
+        return Status::OK();
+    }
+    {
+        std::lock_guard<std::mutex> lock(hot_stats_mutex_);
+        if (hot_region_set_.find(shard_idx) == hot_region_set_.end()) {
+            return Status::OK();
+        }
+    }
+    if (value_zone_ == nullptr || bucket_table_handler_ == nullptr || env_ == nullptr || env_->rdma_mg == nullptr) {
+        return Status::IOError("ApplyHotWrite: hot bucket is not initialized");
+    }
+
+    BucketTableBuilder builder(value_zone_, env_->rdma_mg, shard_target_node_id);
+    builder.Add(key, value, sequence, is_deletion);
+    return builder.Finish();
 }
 
 Status DBImpl::Put(const WriteOptions& o, const Slice& key, const Slice& val) {
-    RecordKeyAccess(key, true);
     return DB::Put(o, key, val);
 }
 
 Status DBImpl::Delete(const WriteOptions& options, const Slice& key) {
-    RecordKeyAccess(key, true);
     return DB::Delete(options, key);
 }
 //
@@ -4601,6 +4657,26 @@ Status DBImpl::Delete(const WriteOptions& options, const Slice& key) {
 //
 //  return status;
 //}
+namespace {
+struct HotWriteOperation {
+    std::string key;
+    std::string value;
+    bool is_deletion = false;
+};
+
+class HotWriteCollector : public WriteBatch::Handler {
+public:
+    void Put(const Slice& key, const Slice& value) override {
+        operations.push_back({key.ToString(), value.ToString(), false});
+    }
+    void Delete(const Slice& key) override {
+        operations.push_back({key.ToString(), std::string(), true});
+    }
+
+    std::vector<HotWriteOperation> operations;
+};
+}  // namespace
+
 Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
     //  Writer w(&undefine_mutex);
     //  w.batch = updates;
@@ -4673,6 +4749,30 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
     } else {
         printf("Weird status not OK");
         assert(0 == 1);
+    }
+    if (status.ok() && updates != nullptr) {
+        HotWriteCollector collector;
+        Status collect_status = updates->Iterate(&collector);
+        if (!collect_status.ok()) {
+            status = collect_status;
+        } else {
+            SequenceNumber operation_sequence = sequence;
+            for (const auto& operation : collector.operations) {
+                Slice operation_key(operation.key);
+                RecordKeyAccess(operation_key, true);
+                Status bucket_status = ApplyHotWrite(operation_key, Slice(operation.value), operation_sequence,
+                                                     operation.is_deletion);
+                if (!bucket_status.ok()) {
+                    size_t shard_idx = 0;
+                    if (GetShardIndexForKey(operation_key, &shard_idx)) {
+                        DisableBucketOnlyReads(shard_idx);
+                    }
+                    std::fprintf(stderr, "hot bucket update failed for key %s: %s\n",
+                                 operation.key.c_str(), bucket_status.ToString().c_str());
+                }
+                ++operation_sequence;
+            }
+        }
     }
 //  kv_counter1.fetch_add(1);
 //  if (mem_switching){}
@@ -5148,7 +5248,9 @@ DB::~DB() = default;
 Status DB::Open(const Options& options, const std::string& dbname, DB** dbptr) {
     *dbptr = nullptr;
 
-    const unsigned long long max_key_range = (1ull << 60);
+    // Bucket addressing uses a 4-byte offset slot. Keep the DB's numeric
+    // key range identical to the total addressable range of all buckets.
+    const unsigned long long max_key_range = BUCKET_NUMBER * SLOT_NUM_PER_BUCKET;
 
     if (options.ShardInfo == nullptr) {
         // If it is not sharded

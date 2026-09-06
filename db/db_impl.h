@@ -243,7 +243,10 @@ private:
     void bucket_meta_update_handler(RDMA_Request* request);
     bool ShouldReadSSTForKey(const Slice& user_key, size_t shard_idx, SequenceNumber* cutover_sequence);
     bool TryGetValueFromBucket(size_t shard_idx, const Slice& user_key, std::string* value, SequenceNumber* seq,
-                               Status* status);
+                               bool* is_deletion, Status* status);
+    bool GetShardIndexForKey(const Slice& key, size_t* shard_idx) const;
+    Status ApplyHotWrite(const Slice& key, const Slice& value, SequenceNumber sequence, bool is_deletion);
+    void DisableBucketOnlyReads(size_t shard_idx);
 
     
     void RecordKeyAccess(const Slice& key, bool is_write);
@@ -255,8 +258,8 @@ private:
     static void BGWork_HotnessAdjustment(void* db);
     void BackgroundHotnessAdjustment();
 
-    void Hot2Cold(size_t shard_idx);
-    void Cold2Hot(size_t shard_idx);
+    Status Hot2Cold(size_t shard_idx);
+    Status Cold2Hot(size_t shard_idx);
     Status EnsureBucketAllocatedForShard(size_t shard_idx);
     void GetShardKeyRange(size_t shard_idx, uint64_t* min_key, uint64_t* max_key) const;
 
@@ -359,7 +362,8 @@ private:
 
     struct ShardConfig {
         size_t max_bucket_tables = 16;  // Maximum number of bucket tables allowed per shard
-        size_t KV_shards = 32;
+        // One key-range shard maps exactly to one bucket table.
+        size_t KV_shards = BUCKET_NUMBER;
     };
 
     const ShardConfig shard_config_ = ShardConfig();

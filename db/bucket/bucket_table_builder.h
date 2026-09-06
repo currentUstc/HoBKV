@@ -29,6 +29,8 @@ public:
     struct BucketUpdate {
         uint64_t key_index;
         uint64_t offset_units;
+        uint64_t sequence_number;
+        bool is_deletion;
     };
 
     explicit BucketTableBuilder(const std::shared_ptr<ValueZone>& value_zone);
@@ -36,7 +38,8 @@ public:
                        uint8_t target_node_id);
     ~BucketTableBuilder() {}
 
-    void Add(const Slice& key, const Slice& value);
+    void Add(const Slice& key, const Slice& value, uint64_t sequence_number = 0,
+             bool is_deletion = false);
     
     Status Finish();
 
@@ -46,11 +49,13 @@ public:
 
 private:
     static constexpr size_t kAlignBytes = 8;
-    static constexpr size_t kUpdatePairBytes = sizeof(uint64_t) * 2;
+    static constexpr size_t kUpdatePairBytes = sizeof(uint64_t) * 4;
 
     struct PendingEntry {
         uint64_t key_index;
         uint64_t local_offset_bytes;
+        uint64_t sequence_number;
+        bool is_deletion;
     };
 
     struct UpdateBatch {
@@ -68,6 +73,7 @@ private:
     uint64_t local_offset_bytes_ = 0;
     uint64_t value_zone_base_offset_units_ = 0;
     bool finished_ = false;
+    Status status_;
 
 };
 

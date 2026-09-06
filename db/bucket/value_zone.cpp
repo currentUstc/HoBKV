@@ -7,8 +7,50 @@
 
 namespace TimberSaw {
 
+namespace {
+constexpr size_t kValueZoneAlignment = 8;
+
+size_t AlignUp(size_t value, size_t alignment) {
+    return (value + alignment - 1) / alignment * alignment;
+}
+}  // namespace
+
+Status AppendValueZoneEntry(const Slice& key, const Slice& value, uint64_t sequence_number,
+                            bool is_deletion, std::string* destination, uint64_t* key_index_out) {
+    if (destination == nullptr) {
+        return Status::InvalidArgument("ValueZone: destination is null");
+    }
+    uint64_t key_index = 0;
+    if (!key.TryGetIndex(&key_index)) {
+        return Status::InvalidArgument("ValueZone: bucket keys must be unsigned decimal integers");
+    }
+
+    const size_t padded_key_size = AlignUp(key.size(), kValueZoneAlignment);
+    const size_t padded_value_size = AlignUp(value.size(), kValueZoneAlignment);
+    const uint64_t total_size = static_cast<uint64_t>(
+        6 * sizeof(uint64_t) + padded_key_size + padded_value_size + sizeof(uint64_t));
+
+    PutFixed64(destination, total_size);
+    PutFixed64(destination, key_index);
+    PutFixed64(destination, sequence_number);
+    PutFixed64(destination, is_deletion ? 1 : 0);
+    PutFixed64(destination, key.size());
+    PutFixed64(destination, value.size());
+    destination->append(key.data(), key.size());
+    destination->append(padded_key_size - key.size(), '\0');
+    destination->append(value.data(), value.size());
+    destination->append(padded_value_size - value.size(), '\0');
+    PutFixed32(destination, 0);  // next
+    PutFixed32(destination, 0);  // prev
+
+    if (key_index_out != nullptr) {
+        *key_index_out = key_index;
+    }
+    return Status::OK();
+}
+
 ValueZone::ValueZone(char* data, size_t max_size, std::shared_ptr<RDMA_Manager> rdma_mg)
-    : max_size_(VALUE_ZONE_MAX_SIZE - 16),
+    : max_size_(max_size > 16 ? max_size - 16 : 0),
       head(8),
       tail(8),
       rdma_mg_(rdma_mg) {
@@ -50,11 +92,17 @@ Status ValueZone::AllocSpace() {
 }
 
 Status ValueZone::Put(const Slice& key, const Slice& value, uint64_t sequence_number,
-                       uint64_t prev_offset, uint64_t& offset) {
-    return Status::NotSupported("ValueZone: Local put not yet implemented");
+                      bool is_deletion, uint64_t& offset) {
+    std::string entry;
+    Status s = AppendValueZoneEntry(key, value, sequence_number, is_deletion, &entry, nullptr);
+    if (!s.ok()) {
+        return s;
+    }
+    return BatchedPut(entry, &offset);
 }
 
 Status ValueZone::BatchedPut(const std::string& batch, uint64_t* base_offset_units) {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (batch.empty()) {
         return Status::OK();
     }
@@ -122,7 +170,9 @@ Status ValueZone::Get(uint64_t offset, Slice& value) {
     return GetWithSequence(offset, value, nullptr);
 }
 
-Status ValueZone::GetWithSequence(uint64_t offset, Slice& value, uint64_t* sequence_number) {
+Status ValueZone::GetWithSequence(uint64_t offset, Slice& value, uint64_t* sequence_number,
+                                  bool* is_deletion) {
+    std::lock_guard<std::mutex> lock(mutex_);
     // offset 以 8B 为单位，且 >= 1
     // offset=1 表示读取位置 8B
     if (offset < 1) {
@@ -158,7 +208,7 @@ Status ValueZone::GetWithSequence(uint64_t offset, Slice& value, uint64_t* seque
     uint64_t total_size;
     memcpy(&total_size, local_mr->addr, 8);
     
-    if (total_size < 32 || total_size > 100 * 1024 * 1024) {  // 基本合法性检查
+    if (total_size < 56 || total_size > 100 * 1024 * 1024) {  // 基本合法性检查
         return Status::Corruption("ValueZone: Invalid total_size");
     }
     
@@ -212,23 +262,29 @@ Status ValueZone::GetWithSequence(uint64_t offset, Slice& value, uint64_t* seque
         offset_in_mr = 0;
     }
     
-    // 第四步：从读取的数据中解析出 value
-    // 数据格式：[key_data(8B), sequence_number(8B), value_data(variable), next(4B), prev(4B)]
-    
+    // data_buffer starts immediately after total_size.
     if (sequence_number != nullptr) {
         *sequence_number = DecodeFixed64(data_buffer + 8);
     }
-
-    // 跳过 key_data (8B) 和 sequence_number (8B)
-    size_t parse_offset = 16;
-    
-    // 计算 value_size：total_size - 8(total_size本身) - 8(key) - 8(seq) - 8(next+prev)
-    // 即：data_to_read - 8(key) - 8(seq) - 8(next+prev) = data_to_read - 24
-    size_t value_size = data_to_read - 24;
+    if (is_deletion != nullptr) {
+        *is_deletion = DecodeFixed64(data_buffer + 16) != 0;
+    }
+    const uint64_t key_size = DecodeFixed64(data_buffer + 24);
+    const uint64_t value_size_raw = DecodeFixed64(data_buffer + 32);
+    const size_t padded_key_size = AlignUp(static_cast<size_t>(key_size), kValueZoneAlignment);
+    const size_t value_size = static_cast<size_t>(value_size_raw);
+    const size_t parse_offset = 40 + padded_key_size;
+    if (parse_offset + sizeof(uint64_t) > data_to_read ||
+        value_size > data_to_read - parse_offset - sizeof(uint64_t)) {
+        delete[] data_buffer;
+        return Status::Corruption("ValueZone: invalid key/value sizes");
+    }
     
     // 提取 value_data
-    char* value_buffer = new char[value_size];
-    memcpy(value_buffer, data_buffer + parse_offset, value_size);
+    char* value_buffer = new char[value_size == 0 ? 1 : value_size];
+    if (value_size > 0) {
+        memcpy(value_buffer, data_buffer + parse_offset, value_size);
+    }
     
     // 清理临时缓冲区
     delete[] data_buffer;
@@ -238,10 +294,6 @@ Status ValueZone::GetWithSequence(uint64_t offset, Slice& value, uint64_t* seque
     
     // 调用者负责释放 value 的内存
     return Status::OK();
-}
-
-Status ValueZone::Cleanup() {
-    return Status::NotSupported("ValueZone: Cleanup not yet implemented");
 }
 
 }  // namespace TimberSaw

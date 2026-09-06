@@ -190,7 +190,8 @@ private:
 
     void flush_helper_handler(void* arg);
     void hot_to_cold_handler(void* arg);
-    void hot_to_cold_worker(uint64_t shard_idx, uint64_t bucket_idx, std::string client_ip, uint8_t target_node_id);
+    Status hot_to_cold_worker(uint64_t shard_idx, uint64_t bucket_idx, std::string client_ip,
+                              uint8_t target_node_id);
     void cold_to_hot_handler(void* arg);
 
     void qp_reset_handler(RDMA_Request* request, std::string& client_ip, int socket_fd, uint8_t target_node_id);
@@ -219,8 +220,10 @@ private:
                                        uint8_t target_node_id);
 
     std::mutex bucket_table_mu_;
+    std::mutex bucket_update_mu_;
     std::unordered_map<uint64_t, std::shared_ptr<BucketTableBuilderMemorySide>> bucket_table_builders_;
     std::unordered_map<uint64_t, ibv_mr> bucket_table_mrs_;
+    std::unordered_map<uint64_t, SequenceNumber> latest_bucket_sequence_by_key_;
 
     std::mutex cold_to_hot_meta_mu_;
     std::vector<std::shared_ptr<RemoteMemTableMetaData>> cold_to_hot_pending_ssts_;

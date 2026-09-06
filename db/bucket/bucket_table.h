@@ -22,16 +22,21 @@ public:
     BucketTable(Slice min_key, Slice max_key, const ibv_mr& bucket_mr, std::shared_ptr<RDMA_Manager> rdma_mg);
     ~BucketTable();
 
-    // Status update(const Slice& key, const unsigned offset);
+    BucketTable(const BucketTable&) = delete;
+    BucketTable& operator=(const BucketTable&) = delete;
+    BucketTable(BucketTable&&) = delete;
+    BucketTable& operator=(BucketTable&&) = delete;
+
     Status get(const Slice& key, unsigned& offset);
     const ibv_mr& bucket_mr() const { return bucket_mr_; }
 
 private:
     char* bucket_data_;
-    Slice min_key_;
-    Slice max_key_;
+    uint64_t min_key_index_ = 0;
+    uint64_t max_key_index_ = 0;
     std::shared_ptr<RDMA_Manager> rdma_mg_;
     ibv_mr bucket_mr_;
+    bool owns_remote_memory_ = false;
 };
 
 }

@@ -13,12 +13,6 @@
 
 namespace TimberSaw {
 
-namespace {
-inline size_t AlignUp(size_t value, size_t align) {
-	return (value + align - 1) / align * align;
-}
-}  // namespace
-
 BucketTableBuilder::BucketTableBuilder(const std::shared_ptr<ValueZone>& value_zone)
 	: value_zone_(value_zone) {}
 
@@ -27,19 +21,27 @@ BucketTableBuilder::BucketTableBuilder(const std::shared_ptr<ValueZone>& value_z
                                        uint8_t target_node_id)
 	: value_zone_(value_zone), rdma_mg_(rdma_mg), target_node_id_(target_node_id) {}
 
-void BucketTableBuilder::Add(const Slice& key, const Slice& value) {
+void BucketTableBuilder::Add(const Slice& key, const Slice& value, uint64_t sequence_number,
+                             bool is_deletion) {
     // user key
 	assert(!finished_);
-	const uint64_t key_index = static_cast<uint64_t>(key.Index());
-	const uint64_t local_offset_units = local_offset_bytes_ / kAlignBytes;
-
-	const size_t value_padded = AlignUp(value.size(), kAlignBytes);
-	const uint64_t total_size = static_cast<uint64_t>(
-		kAlignBytes + kAlignBytes + kAlignBytes + value_padded + kAlignBytes);
+	if (!status_.ok()) {
+		return;
+	}
+	uint64_t key_index = 0;
+	const uint64_t entry_offset = value_zone_buffer_.size();
+	status_ = AppendValueZoneEntry(key, value, sequence_number, is_deletion,
+	                               &value_zone_buffer_, &key_index);
+	if (!status_.ok()) {
+		return;
+	}
+	const uint64_t local_offset_units = entry_offset / kAlignBytes;
 
 	PendingEntry entry{
 		key_index,
-		local_offset_bytes_,
+		entry_offset,
+		sequence_number,
+		is_deletion,
 	};
 	pending_entries_.push_back(entry);
 
@@ -53,20 +55,11 @@ void BucketTableBuilder::Add(const Slice& key, const Slice& value) {
 	// TODO: 这里的 local_offset 需要在之后换算为全局的 offset ，
 	PutFixed64(&update_batches_.back().buffer, key_index);
 	PutFixed64(&update_batches_.back().buffer, local_offset_units);
+	PutFixed64(&update_batches_.back().buffer, sequence_number);
+	PutFixed64(&update_batches_.back().buffer, is_deletion ? 1 : 0);
 	update_batches_.back().kv_count += 1;
 
-	PutFixed64(&value_zone_buffer_, total_size);
-	PutFixed64(&value_zone_buffer_, key_index);
-	PutFixed64(&value_zone_buffer_, 0);  // sequence_number
-	value_zone_buffer_.append(value.data(), value.size());
-	if (value_padded > value.size()) {
-		const size_t pad = value_padded - value.size();
-		value_zone_buffer_.append(pad, '\0');
-	}
-	PutFixed32(&value_zone_buffer_, 0);  // next
-	PutFixed32(&value_zone_buffer_, 0);  // prev
-
-	local_offset_bytes_ += total_size;
+	local_offset_bytes_ = value_zone_buffer_.size();
 }
 
 Status BucketTableBuilder::Finish() {
@@ -74,6 +67,9 @@ Status BucketTableBuilder::Finish() {
 		return Status::OK();
 	}
 	finished_ = true;
+	if (!status_.ok()) {
+		return status_;
+	}
 
 	if (!value_zone_) {
 		return Status::InvalidArgument("BucketTableBuilder: value zone is null");
@@ -93,7 +89,8 @@ Status BucketTableBuilder::Finish() {
 	for (const auto& entry : pending_entries_) {
 		const uint64_t absolute_offset_units =
 			value_zone_base_offset_units_ + (entry.local_offset_bytes / kAlignBytes);
-		bucket_updates_.push_back({entry.key_index, absolute_offset_units});
+		bucket_updates_.push_back(
+			{entry.key_index, absolute_offset_units, entry.sequence_number, entry.is_deletion});
 	}
 
 	if (rdma_mg_ && !bucket_updates_.empty()) {
@@ -157,6 +154,12 @@ Status BucketTableBuilder::Finish() {
 				rdma_mg_->Deallocate_Local_RDMA_Slot(receive_mr.addr, Message);
 				rdma_mg_->Deallocate_Local_RDMA_Slot(updates_mr.addr, FlushBuffer);
 				return Status::IOError("BucketTableBuilder: flush helper reply timeout");
+			}
+			if (receive_pointer->content.error_count != 0) {
+				rdma_mg_->Deallocate_Local_RDMA_Slot(send_mr.addr, Message);
+				rdma_mg_->Deallocate_Local_RDMA_Slot(receive_mr.addr, Message);
+				rdma_mg_->Deallocate_Local_RDMA_Slot(updates_mr.addr, FlushBuffer);
+				return Status::IOError("BucketTableBuilder: memory-side bucket update failed");
 			}
 
 			rdma_mg_->Deallocate_Local_RDMA_Slot(send_mr.addr, Message);

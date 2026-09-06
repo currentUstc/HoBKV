@@ -429,6 +429,8 @@ if(TimberSaw_BUILD_TESTS)
 #  TimberSaw_test("util/env_test.cc")
 #  TimberSaw_test("util/status_test.cc")
 #  TimberSaw_test("util/no_destructor_test.cc")
+
+  TimberSaw_test("db/bucket/bucket_test.cc")
 #
 #  if(NOT BUILD_SHARED_LIBS)
 #    TimberSaw_test("db/autocompact_test.cc")

@@ -48,6 +48,26 @@
 //      stats       -- Print DB stats
 //      sstables    -- Print sstable info
 //      heapprofile -- Dump a heap profile (if supported by this port)
+
+
+const uint64_t MAX_KEY_VALUE = BUCKET_NUMBER * SLOT_NUM_PER_BUCKET - 1;
+
+static uint64_t GetMaxSliceCompatibleKeyValue(size_t key_size) {
+    uint64_t range_max = MAX_KEY_VALUE;
+    if (key_size == 0) {
+        return 0;
+    }
+    uint64_t digits_max = 0;
+    size_t digits = key_size < 10 ? key_size : 10;
+    for (size_t i = 0; i < digits; ++i) {
+        digits_max = digits_max * 10 + 9;
+    }
+    if (digits_max < range_max) {
+        range_max = digits_max;
+    }
+    return range_max;
+}
+
 static const char* FLAGS_benchmarks =
     "fillseq,"
     "fillsync,"
@@ -249,14 +269,16 @@ class KeyBuffer {
 public:
     KeyBuffer() {
         assert(FLAGS_key_prefix < sizeof(buffer_));
-        memset(buffer_, 'a', FLAGS_key_prefix);
+        memset(buffer_, '0', FLAGS_key_prefix);
     }
     KeyBuffer& operator=(KeyBuffer& other) = delete;
     KeyBuffer(KeyBuffer& other) = delete;
 
     void Set(int k) {
+        const uint64_t range_max = GetMaxSliceCompatibleKeyValue(20);
+        const uint64_t normalized = static_cast<uint64_t>(k) % (range_max + 1);
         std::snprintf(buffer_ + FLAGS_key_prefix, sizeof(buffer_) - FLAGS_key_prefix, "%020d",
-                      k);  //%016d means preceeding with 0s
+                      static_cast<int>(normalized));  //%016d means preceeding with 0s
     }
 
     Slice slice() const { return Slice(buffer_, FLAGS_key_prefix + 20); }
@@ -646,50 +668,31 @@ public:
         delete filter_policy_;
     }
     Slice AllocateKey(std::unique_ptr<const char[]>* key_guard) {
-        char* data = new char[FLAGS_key_size];
+        char* data = new char[FLAGS_key_size + 1];
+        memset(data, '0', FLAGS_key_size);
+        data[FLAGS_key_size] = '\0';
         const char* const_data = data;
         key_guard->reset(const_data);
         return Slice(key_guard->get(), FLAGS_key_size);
     }
     Slice AllocateKey(std::unique_ptr<const char[]>* key_guard, size_t key_size) {
-        char* data = new char[key_size];
+        char* data = new char[key_size + 1];
+        memset(data, '0', key_size);
+        data[key_size] = '\0';
         const char* const_data = data;
         key_guard->reset(const_data);
         return Slice(key_guard->get(), key_size);
     }
     void GenerateKeyFromInt(uint64_t v, Slice* key) {
         char* start = const_cast<char*>(key->data());
-        char* pos = start;
-        //    if (keys_per_prefix_ > 0) {
-        //      int64_t num_prefix = num_keys / keys_per_prefix_;
-        //      int64_t prefix = v % num_prefix;
-        //      int bytes_to_fill = std::min(prefix_size_, 8);
-        //      if (port::kLittleEndian) {
-        //        for (int i = 0; i < bytes_to_fill; ++i) {
-        //          pos[i] = (prefix >> ((bytes_to_fill - i - 1) << 3)) & 0xFF;
-        //        }
-        //      } else {
-        //        memcpy(pos, static_cast<void*>(&prefix), bytes_to_fill);
-        //      }
-        //      if (prefix_size_ > 8) {
-        //        // fill the rest with 0s
-        //        memset(pos + 8, '0', prefix_size_ - 8);
-        //      }
-        //      pos += prefix_size_;
-        //    }
-
-        int bytes_to_fill = std::min(FLAGS_key_size, 8);
-        if (port::kLittleEndian) {
-            for (int i = 0; i < bytes_to_fill; ++i) {
-                pos[i] = (v >> ((bytes_to_fill - i - 1) << 3)) & 0xFF;
-            }
-        } else {
-            memcpy(pos, static_cast<void*>(&v), bytes_to_fill);
+        size_t key_size = key->size();
+        if (key_size == 0) {
+            return;
         }
-        pos += bytes_to_fill;
-        if (FLAGS_key_size > pos - start) {
-            memset(pos, '0', FLAGS_key_size - (pos - start));
-        }
+        const uint64_t range_max = GetMaxSliceCompatibleKeyValue(key_size);
+        const uint64_t normalized = v % (range_max + 1);
+        std::snprintf(start, key_size + 1, "%0*llu", static_cast<int>(key_size),
+                      static_cast<unsigned long long>(normalized));
     }
     void Run() {
         PrintHeader();

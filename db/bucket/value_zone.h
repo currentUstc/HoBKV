@@ -6,18 +6,26 @@
 #include <include/TimberSaw/options.h>
 #include <util/rdma.h>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 #include <cstdint>
 
 namespace TimberSaw {
 
+// Serialized entry format (all scalar fields are fixed64):
+// [total_size, key_index, sequence, type, key_size, value_size,
+//  padded key, padded value, next+prev]
+Status AppendValueZoneEntry(const Slice& key, const Slice& value, uint64_t sequence_number,
+                            bool is_deletion, std::string* destination, uint64_t* key_index);
+
 /*  
     Value Zone for storing values.
         Values are stored in a contiguous memory region.
     Entry format (每个字段8B对齐):
-        [total_size(8B), key_data(8B), sequence_number(8B), value_data(variable), next(4B) + prev(4B) = 8B]
-        key_data is fixed 8B (no key_size field needed).
+        [total_size, key_index, sequence_number, value_type, key_size, value_size,
+         key_data, value_data, next(4B) + prev(4B)]
+        原始 key 会被保留，以便热转冷时重建完全相同的 SST key。
         next and prev are offsets to entries with the same key (forming a doubly linked list).
         offset of 0 means null (end of list).
 */
@@ -29,8 +37,8 @@ public:
 
     // Put: 追加写入一个新条目，返回该条目的 offset
     // 如果已存在相同 key 的条目，将新条目链接到链表中
-    Status Put(const Slice& key, const Slice& value, uint64_t sequence_number, 
-               uint64_t prev_offset, uint64_t& offset);
+    Status Put(const Slice& key, const Slice& value, uint64_t sequence_number,
+               bool is_deletion, uint64_t& offset);
 
     // 在 BucketTableBuilder 中调用 BatchedPut 来写入全部条目，同一时间仅能有一个写入操作。
     Status BatchedPut(const std::string& batch, uint64_t* base_offset_units);
@@ -38,12 +46,9 @@ public:
     // Get: 根据 offset 读取一个条目，返回该条目以及通过链表关联的所有条目
     // 返回格式: vector of (sequence_number, value)
     Status Get(uint64_t offset, Slice &value);
-    Status GetWithSequence(uint64_t offset, Slice& value, uint64_t* sequence_number);
+    Status GetWithSequence(uint64_t offset, Slice& value, uint64_t* sequence_number,
+                           bool* is_deletion = nullptr);
     
-    // Cleanup: 清理无效条目，压缩存储空间
-    // 从尾部读取，保留有效条目并重新写入头部，维护双向链表结构
-    Status Cleanup();
-
     Status AllocSpace();
 
     uint64_t GetCurrentOffset() const { return head; }
@@ -82,6 +87,7 @@ private:
     uint64_t tail;
     std::shared_ptr<RDMA_Manager> rdma_mg_;   // RDMA 管理器
     std::vector<ibv_mr> value_zone_mr_list_;                    // RDMA 内存注册
+    mutable std::mutex mutex_;
 };
 
 }

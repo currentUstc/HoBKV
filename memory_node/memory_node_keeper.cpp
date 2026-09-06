@@ -25,19 +25,22 @@ namespace TimberSaw {
 
 namespace {
 
-// 在单个 MR 上按 offset 解析 value zone 条目并提取 value。
-bool TryExtractValueFromMR(const ibv_mr* mr, uint64_t offset_units, uint64_t expected_key_index, std::string* value) {
-    if (mr == nullptr || mr->addr == nullptr || value == nullptr) {
+// 在单个 MR 上按 offset 解析 value zone 条目。
+bool TryExtractValueFromMR(const ibv_mr* mr, uint64_t offset_units, uint64_t expected_key_index,
+                           std::string* key, std::string* value, SequenceNumber* sequence,
+                           ValueType* value_type) {
+    if (mr == nullptr || mr->addr == nullptr || key == nullptr || value == nullptr ||
+        sequence == nullptr || value_type == nullptr) {
         return false;
     }
-    const uint64_t byte_offset = offset_units * 8;
-    if (byte_offset + 24 > mr->length) {
+    const uint64_t byte_offset = (offset_units * 8) % VALUE_ZONE_ALLOC_SIZE;
+    if (byte_offset + 48 > mr->length) {
         return false;
     }
 
     const char* base = static_cast<const char*>(mr->addr) + byte_offset;
     const uint64_t total_size = DecodeFixed64(base);
-    if (total_size < 32 || total_size > (64ull * 1024ull * 1024ull)) {
+    if (total_size < 56 || total_size > (64ull * 1024ull * 1024ull)) {
         return false;
     }
     if (byte_offset + total_size > mr->length) {
@@ -49,26 +52,36 @@ bool TryExtractValueFromMR(const ibv_mr* mr, uint64_t offset_units, uint64_t exp
         return false;
     }
 
-    const size_t value_size = static_cast<size_t>(total_size - 32);
-    value->assign(base + 24, value_size);
+    const uint64_t raw_type = DecodeFixed64(base + 24);
+    const uint64_t key_size = DecodeFixed64(base + 32);
+    const uint64_t value_size = DecodeFixed64(base + 40);
+    const size_t padded_key_size = (static_cast<size_t>(key_size) + 7) / 8 * 8;
+    const size_t padded_value_size = (static_cast<size_t>(value_size) + 7) / 8 * 8;
+    if (48 + padded_key_size + padded_value_size + 8 != total_size) {
+        return false;
+    }
+
+    key->assign(base + 48, static_cast<size_t>(key_size));
+    value->assign(base + 48 + padded_key_size, static_cast<size_t>(value_size));
+    *sequence = DecodeFixed64(base + 16);
+    *value_type = raw_type == 0 ? kTypeValue : kTypeDeletion;
     return true;
 }
 
 // 在本地所有已注册 MR 中尝试定位 offset 对应条目。
 bool TryExtractValueFromLocalPools(const std::vector<ibv_mr*>& local_mem_pool, uint64_t offset_units,
-                                   uint64_t expected_key_index, std::string* value) {
+                                   uint64_t expected_key_index, std::string* key, std::string* value,
+                                   SequenceNumber* sequence, ValueType* value_type) {
     for (const auto* mr : local_mem_pool) {
-        if (TryExtractValueFromMR(mr, offset_units, expected_key_index, value)) {
+        if (TryExtractValueFromMR(mr, offset_units, expected_key_index, key, value, sequence, value_type)) {
             return true;
         }
     }
     return false;
 }
 
-// 将 key_index 转换为内部键编码。
-std::string BuildInternalKeyFromKeyIndex(uint64_t key_index) {
-    std::string user_key = std::to_string(key_index);
-    ParsedInternalKey pik(Slice(user_key), kMaxSequenceNumber, kTypeValue);
+std::string BuildInternalKey(const std::string& user_key, SequenceNumber sequence, ValueType value_type) {
+    ParsedInternalKey pik(Slice(user_key), sequence, value_type);
     std::string internal_key;
     AppendInternalKey(&internal_key, pik);
     return internal_key;
@@ -2328,16 +2341,18 @@ void Memory_Node_Keeper::flush_helper_handler(void* arg) {
         rdma_mg->RDMA_Read(&remote_mr, &updates_mr, buffer_size, client_ip, IBV_SEND_SIGNALED, 1, target_node_id);
     }
 
-    const size_t pair_size = sizeof(uint64_t) * 2;
+    const size_t pair_size = sizeof(uint64_t) * 4;
     const size_t max_kv_count = buffer_size / pair_size;
     const size_t kv_count = kv_count_in < max_kv_count ? kv_count_in : max_kv_count;
 
     const char* ptr = static_cast<const char*>(updates_mr.addr);
     size_t error_count = 0;
     const size_t kMaxErrorLogs = 10;
+    std::lock_guard<std::mutex> update_lock(bucket_update_mu_);
     for (size_t i = 0; i < kv_count; ++i) {
         const uint64_t key_index = DecodeFixed64(ptr);
         const uint64_t offset_units = DecodeFixed64(ptr + sizeof(uint64_t));
+        const SequenceNumber sequence = DecodeFixed64(ptr + sizeof(uint64_t) * 2);
         const uint64_t bucket_idx = key_index / SLOT_NUM_PER_BUCKET;
         const uint64_t slot_idx = key_index % SLOT_NUM_PER_BUCKET;
 
@@ -2362,12 +2377,20 @@ void Memory_Node_Keeper::flush_helper_handler(void* arg) {
             continue;
         }
 
+        auto sequence_it = latest_bucket_sequence_by_key_.find(key_index);
+        if (sequence_it != latest_bucket_sequence_by_key_.end() && sequence < sequence_it->second) {
+            ptr += pair_size;
+            continue;
+        }
+
         Status s = builder->UpdateSlot(slot_idx, offset_units);
         if (!s.ok()) {
             if (error_count < kMaxErrorLogs) {
                 std::fprintf(stderr, "flush_helper: update slot failed: %s\n", s.ToString().c_str());
             }
             error_count++;
+        } else {
+            latest_bucket_sequence_by_key_[key_index] = sequence;
         }
         ptr += pair_size;
     }
@@ -2375,6 +2398,8 @@ void Memory_Node_Keeper::flush_helper_handler(void* arg) {
     ibv_mr send_mr = {};
     rdma_mg->Allocate_Local_RDMA_Slot(send_mr, Message);
     RDMA_Reply* send_pointer = (RDMA_Reply*)send_mr.addr;
+    *send_pointer = {};
+    send_pointer->content.error_count = error_count;
     send_pointer->received = true;
     rdma_mg->RDMA_Write(request->buffer, request->rkey, &send_mr, sizeof(RDMA_Reply), client_ip, IBV_SEND_SIGNALED, 1,
                         target_node_id);
@@ -2393,21 +2418,20 @@ void Memory_Node_Keeper::hot_to_cold_handler(void* arg) {
 
     const uint64_t shard_idx = request->content.hot_to_cold.shard_idx;
     const uint64_t bucket_idx = shard_idx % BUCKET_NUMBER;
-    {
+    // Do not acknowledge the transition until the bucket has been materialized
+    // as an SST and its slots have been cleared. This keeps reads correct during
+    // the cut-over and avoids an untracked detached worker.
+    Status transition_status = hot_to_cold_worker(shard_idx, bucket_idx, client_ip, target_node_id);
+    if (transition_status.ok()) {
         std::lock_guard<std::mutex> lock(cold_to_hot_meta_mu_);
         bucket_migration_meta_by_shard_.erase(shard_idx);
     }
-    const std::string client_ip_copy = client_ip;
-    const uint8_t target_node_id_copy = target_node_id;
-
-    std::thread hot_to_cold_thread([this, shard_idx, bucket_idx, client_ip_copy, target_node_id_copy]() {
-        this->hot_to_cold_worker(shard_idx, bucket_idx, client_ip_copy, target_node_id_copy);
-    });
-    hot_to_cold_thread.detach();
 
     ibv_mr send_mr = {};
     rdma_mg->Allocate_Local_RDMA_Slot(send_mr, Message);
     RDMA_Reply* send_pointer = (RDMA_Reply*)send_mr.addr;
+    *send_pointer = {};
+    send_pointer->content.error_count = transition_status.ok() ? 0 : 1;
     send_pointer->received = true;
     rdma_mg->RDMA_Write(request->buffer, request->rkey, &send_mr, sizeof(RDMA_Reply), client_ip, IBV_SEND_SIGNALED, 1,
                         target_node_id);
@@ -2430,36 +2454,40 @@ void Memory_Node_Keeper::cold_to_hot_handler(void* arg) {
     const SequenceNumber cutover_sequence = request->content.cold_to_hot.cutover_sequence;
 
     ibv_mr bucket_mr = request->content.cold_to_hot.bucket_mr;
-    if (bucket_mr.addr != nullptr) {
+    const bool valid_bucket = bucket_mr.addr != nullptr;
+    if (valid_bucket) {
         std::lock_guard<std::mutex> lock(bucket_table_mu_);
         bucket_table_mrs_[bucket_idx] = bucket_mr;
         bucket_table_builders_[bucket_idx] =
             std::make_shared<BucketTableBuilderMemorySide>(static_cast<char*>(bucket_mr.addr), bucket_mr.length);
     }
 
-    BucketMigrationMeta meta;
-    meta.shard_idx = shard_idx;
-    meta.bucket_idx = bucket_idx;
-    meta.min_key = min_key;
-    meta.max_key = max_key;
-    meta.cutover_sequence = cutover_sequence;
-    meta.subrange_overlap_counts.assign(kBucketSubrangeCount, 0);
-    meta.subrange_bitmap.assign(kBucketSubrangeCount, 0);
-    RecomputeBucketMigrationMeta(&meta);
-
     size_t migrating_subranges = 0;
-    for (uint8_t bit : meta.subrange_bitmap) {
-        if (bit != 0) {
-            ++migrating_subranges;
-        }
-    }
-    const size_t bucket_only_subranges = meta.subrange_bitmap.size() - migrating_subranges;
+    size_t bucket_only_subranges = 0;
+    if (valid_bucket) {
+        BucketMigrationMeta meta;
+        meta.shard_idx = shard_idx;
+        meta.bucket_idx = bucket_idx;
+        meta.min_key = min_key;
+        meta.max_key = max_key;
+        meta.cutover_sequence = cutover_sequence;
+        meta.subrange_overlap_counts.assign(kBucketSubrangeCount, 0);
+        meta.subrange_bitmap.assign(kBucketSubrangeCount, 0);
+        RecomputeBucketMigrationMeta(&meta);
 
-    {
-        std::lock_guard<std::mutex> lock(cold_to_hot_meta_mu_);
-        bucket_migration_meta_by_shard_[shard_idx] = meta;
+        for (uint8_t bit : meta.subrange_bitmap) {
+            if (bit != 0) {
+                ++migrating_subranges;
+            }
+        }
+        bucket_only_subranges = meta.subrange_bitmap.size() - migrating_subranges;
+
+        {
+            std::lock_guard<std::mutex> lock(cold_to_hot_meta_mu_);
+            bucket_migration_meta_by_shard_[shard_idx] = meta;
+        }
+        SendBucketMetaUpdateToCompute(meta, client_ip, target_node_id);
     }
-    SendBucketMetaUpdateToCompute(meta, client_ip, target_node_id);
 
     std::fprintf(stdout,
                  "cold_to_hot(meta): shard=%llu, bucket=%llu, key_range=[%llu,%llu), cutover=%llu, "
@@ -2472,6 +2500,8 @@ void Memory_Node_Keeper::cold_to_hot_handler(void* arg) {
     ibv_mr send_mr = {};
     rdma_mg->Allocate_Local_RDMA_Slot(send_mr, Message);
     RDMA_Reply* send_pointer = (RDMA_Reply*)send_mr.addr;
+    *send_pointer = {};
+    send_pointer->content.error_count = valid_bucket ? 0 : 1;
     send_pointer->received = true;
     rdma_mg->RDMA_Write(request->buffer, request->rkey, &send_mr, sizeof(RDMA_Reply), client_ip, IBV_SEND_SIGNALED, 1,
                         target_node_id);
@@ -2482,14 +2512,18 @@ void Memory_Node_Keeper::cold_to_hot_handler(void* arg) {
 }
 
 // 热转冷后台任务：读取 bucket 中的 KV，并在内存侧生成新的 SSTable。
-void Memory_Node_Keeper::hot_to_cold_worker(uint64_t shard_idx, uint64_t bucket_idx, std::string client_ip,
-                                            uint8_t target_node_id) {
+Status Memory_Node_Keeper::hot_to_cold_worker(uint64_t shard_idx, uint64_t bucket_idx, std::string client_ip,
+                                              uint8_t target_node_id) {
     struct KVItem {
         uint64_t key_index;
+        std::string key;
         std::string value;
+        SequenceNumber sequence;
+        ValueType value_type;
     };
 
     std::vector<KVItem> kv_items;
+    std::lock_guard<std::mutex> update_lock(bucket_update_mu_);
     auto builder = GetBucketTableBuilder(bucket_idx);
     if (builder) {
         const uint64_t max_slots = builder->MaxSlots();
@@ -2501,22 +2535,27 @@ void Memory_Node_Keeper::hot_to_cold_worker(uint64_t shard_idx, uint64_t bucket_
             }
 
             const uint64_t key_index = bucket_idx * SLOT_NUM_PER_BUCKET + slot_idx;
+            std::string key;
             std::string value;
-            if (!TryExtractValueFromLocalPools(rdma_mg->local_mem_pool, offset_units, key_index, &value)) {
+            SequenceNumber sequence = 0;
+            ValueType value_type = kTypeValue;
+            if (!TryExtractValueFromLocalPools(rdma_mg->local_mem_pool, offset_units, key_index,
+                                               &key, &value, &sequence, &value_type)) {
                 continue;
             }
-            kv_items.push_back({key_index, std::move(value)});
+            kv_items.push_back({key_index, std::move(key), std::move(value), sequence, value_type});
         }
     }
 
     if (kv_items.empty()) {
         std::fprintf(stdout, "hot_to_cold worker: shard=%llu has no kv to build\n",
                      static_cast<unsigned long long>(shard_idx));
-        return;
+        return Status::OK();
     }
 
-    // std::sort(kv_items.begin(), kv_items.end(),
-    //           [](const KVItem& lhs, const KVItem& rhs) { return lhs.key_index < rhs.key_index; });
+    std::sort(kv_items.begin(), kv_items.end(), [](const KVItem& lhs, const KVItem& rhs) {
+        return BytewiseComparator()->Compare(Slice(lhs.key), Slice(rhs.key)) < 0;
+    });
 
     auto meta = std::make_shared<RemoteMemTableMetaData>(1);
     meta->shard_target_node_id = rdma_mg->node_id;
@@ -2530,7 +2569,7 @@ void Memory_Node_Keeper::hot_to_cold_worker(uint64_t shard_idx, uint64_t bucket_
     TableBuilder* sst_builder = new TableBuilder_Memoryside(*opts, Flush, rdma_mg);
     bool has_key = false;
     for (const auto& kv : kv_items) {
-        std::string internal_key = BuildInternalKeyFromKeyIndex(kv.key_index);
+        std::string internal_key = BuildInternalKey(kv.key, kv.sequence, kv.value_type);
         if (!has_key) {
             meta->smallest.DecodeFrom(Slice(internal_key));
             has_key = true;
@@ -2550,7 +2589,7 @@ void Memory_Node_Keeper::hot_to_cold_worker(uint64_t shard_idx, uint64_t bucket_
     if (!finish_status.ok()) {
         std::fprintf(stderr, "hot_to_cold worker: build sstable failed, shard=%llu, err=%s\n",
                      static_cast<unsigned long long>(shard_idx), finish_status.ToString().c_str());
-        return;
+        return finish_status;
     }
 
     {
@@ -2567,7 +2606,7 @@ void Memory_Node_Keeper::hot_to_cold_worker(uint64_t shard_idx, uint64_t bucket_
             std::fprintf(stderr,
                          "hot_to_cold worker: LogAndApply failed, shard=%llu, err=%s\n",
                          static_cast<unsigned long long>(shard_idx), apply_status.ToString().c_str());
-            return;
+            return apply_status;
         }
         Edit_sync_to_remote(&edit, client_ip, &lck, target_node_id);
     }
@@ -2578,6 +2617,7 @@ void Memory_Node_Keeper::hot_to_cold_worker(uint64_t shard_idx, uint64_t bucket_
         for (uint64_t slot_idx = 0; slot_idx < max_slots; ++slot_idx) {
             Status clear_status = builder->UpdateSlot(slot_idx, 0);
             if (clear_status.ok()) {
+                latest_bucket_sequence_by_key_.erase(bucket_idx * SLOT_NUM_PER_BUCKET + slot_idx);
                 ++cleared_slots;
             }
         }
@@ -2587,6 +2627,7 @@ void Memory_Node_Keeper::hot_to_cold_worker(uint64_t shard_idx, uint64_t bucket_
                  "hot_to_cold worker: built sstable #%llu at L1, shard=%llu, bucket=%llu, entries=%zu, cleared=%zu\n",
                  static_cast<unsigned long long>(meta->number), static_cast<unsigned long long>(shard_idx),
                  static_cast<unsigned long long>(bucket_idx), meta->num_entries, cleared_slots);
+    return Status::OK();
 }
 
 void Memory_Node_Keeper::sst_compaction_handler(void* arg) {

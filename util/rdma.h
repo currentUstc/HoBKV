@@ -89,7 +89,9 @@ enum Chunk_type {
 static const char* EnumStrings[] = {"NULL",        "Message",          "Version_edit",
                                     "IndexChunk",  "IndexChunk_Small", "FilterChunk",
                                     "FlushBuffer", "Default",          "BucketChunk",
-                                    "No_Use_Default_chunk"};
+                                    "ValueZoneChunk", "No_Use_Default_chunk"};
+static_assert(sizeof(EnumStrings) / sizeof(EnumStrings[0]) == No_Use_Default_chunk + 1,
+              "Chunk_type and EnumStrings must stay in sync");
 
 static char config_file_name[100] = "../connection.conf";
 
@@ -213,6 +215,7 @@ union RDMA_Reply_Content {
     ibv_mr mr;
     registered_qp_config qp_config;
     install_versionedit ive;
+    uint64_t error_count;
     //  long double cpu_percent;
     CPU_Info cpu_info;
 };

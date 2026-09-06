@@ -16,8 +16,10 @@
 #define STORAGE_TimberSaw_INCLUDE_SLICE_H_
 
 #include <cassert>
+#include <cstdint>
 #include <cstddef>
 #include <cstring>
+#include <limits>
 #include <string>
 
 #include "TimberSaw/export.h"
@@ -27,16 +29,16 @@ namespace TimberSaw {
 class TimberSaw_EXPORT Slice {
 public:
     // Create an empty slice.
-    Slice() : data_(""), size_(0), data_int_(0) {}
+    Slice() : data_(""), size_(0) {}
 
     // Create a slice that refers to d[0,n-1].
-    Slice(const char* d, size_t n) : data_(d), size_(n), data_int_(std::stoi(d)) {}
+    Slice(const char* d, size_t n) : data_(d), size_(n) {}
 
     // Create a slice that refers to the contents of "s"
-    Slice(const std::string& s) : data_(s.data()), size_(s.size()), data_int_(std::stoi(s)) {}
+    Slice(const std::string& s) : data_(s.data()), size_(s.size()) {}
 
     // Create a slice that refers to s[0,strlen(s)-1]
-    Slice(const char* s) : data_(s), size_(strlen(s)), data_int_(std::stoi(s)) {}
+    Slice(const char* s) : data_(s), size_(strlen(s)) {}
 
     // Intentionally copyable.
     Slice(const Slice&) = default;
@@ -82,7 +84,35 @@ public:
     // Return a string that contains the copy of the referenced data.
     std::string ToString() const { return std::string(data_, size_); }
 
-    unsigned int Index() const { return data_int_; }
+    // Parse a decimal key without changing Slice's arbitrary-byte semantics.
+    // The entire slice must be a valid unsigned decimal integer.
+    bool TryGetIndex(uint64_t* result) const {
+        if (result == nullptr || data_ == nullptr || size_ == 0) {
+            return false;
+        }
+        uint64_t value = 0;
+        for (size_t i = 0; i < size_; ++i) {
+            const unsigned char ch = static_cast<unsigned char>(data_[i]);
+            if (ch < '0' || ch > '9') {
+                return false;
+            }
+            const uint64_t digit = ch - '0';
+            if (value > (std::numeric_limits<uint64_t>::max() - digit) / 10) {
+                return false;
+            }
+            value = value * 10 + digit;
+        }
+        *result = value;
+        return true;
+    }
+
+    // Kept for callers that already require decimal keys. Invalid keys map to
+    // zero; new code should prefer TryGetIndex() so it can detect failure.
+    uint64_t Index() const {
+        uint64_t value = 0;
+        TryGetIndex(&value);
+        return value;
+    }
 
     // Three-way comparison.  Returns value:
     //   <  0 iff "*this" <  "b",
@@ -100,7 +130,6 @@ public:
 
 private:
     const char* data_;
-    unsigned int data_int_ = 0;
     size_t size_;
 };
 
@@ -113,14 +142,6 @@ inline bool operator!=(const Slice& x, const Slice& y) {
 }
 
 inline int Slice::compare(const Slice& b) const {
-    if (data_int_ > 0 && b.data_int_ > 0) {
-        if (data_int_ < b.data_int_)
-            return -1;
-        else if (data_int_ > b.data_int_)
-            return 1;
-        else
-            return 0;
-    }
     const size_t min_len = (size_ < b.size_) ? size_ : b.size_;
     int r = memcmp(data_, b.data_, min_len);
     if (r == 0) {

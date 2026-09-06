@@ -876,7 +876,8 @@ Status FlushJob::BuildTable(const std::string& dbname, Env* env, const Options& 
 #endif
                 builder->Add(key, iter->value());
                 if (collect_hot_kv && db_impl_->IsHotKey(ikey.user_key)) {
-                    hot_builder.Add(ikey.user_key, iter->value());
+                    hot_builder.Add(ikey.user_key, iter->value(), ikey.sequence,
+                                    ikey.type == kTypeDeletion);
                 }
             }
         }
@@ -894,8 +895,11 @@ Status FlushJob::BuildTable(const std::string& dbname, Env* env, const Options& 
         // Finish and check for builder errors
 
         s = builder->Finish();
-        if (collect_hot_kv) {
-            hot_builder.Finish();
+        if (s.ok() && collect_hot_kv) {
+            Status hot_status = hot_builder.Finish();
+            if (!hot_status.ok()) {
+                s = hot_status;
+            }
         }
         builder->get_datablocks_map(meta->remote_data_mrs);
         builder->get_dataindexblocks_map(meta->remote_dataindex_mrs);

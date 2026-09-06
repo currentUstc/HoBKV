@@ -7,7 +7,11 @@
 namespace TimberSaw {
 
 BucketTable::BucketTable(Slice min_key, Slice max_key, std::shared_ptr<RDMA_Manager> rdma_mg) 
-    : min_key_(min_key), max_key_(max_key), rdma_mg_(rdma_mg) {
+    : rdma_mg_(rdma_mg), owns_remote_memory_(true) {
+    const bool valid_range = min_key.TryGetIndex(&min_key_index_) &&
+                             max_key.TryGetIndex(&max_key_index_) &&
+                             min_key_index_ < max_key_index_;
+    assert(valid_range);
     // Allocate the bucket data from RDMA managed memory pool
     // Maybe we need to allocate memory outside BucketTable class, and passing the rdma_mg pointer here.
     // rdma_mg_->Allocate_Local_RDMA_Slot(bucket_mr_, BucketChunk);
@@ -18,13 +22,17 @@ BucketTable::BucketTable(Slice min_key, Slice max_key, std::shared_ptr<RDMA_Mana
 }
 
 BucketTable::BucketTable(Slice min_key, Slice max_key, const ibv_mr& bucket_mr, std::shared_ptr<RDMA_Manager> rdma_mg)
-    : min_key_(min_key), max_key_(max_key), rdma_mg_(rdma_mg), bucket_mr_(bucket_mr) {
+    : rdma_mg_(rdma_mg), bucket_mr_(bucket_mr), owns_remote_memory_(false) {
+    const bool valid_range = min_key.TryGetIndex(&min_key_index_) &&
+                             max_key.TryGetIndex(&max_key_index_) &&
+                             min_key_index_ < max_key_index_;
+    assert(valid_range);
     bucket_data_ = static_cast<char*>(bucket_mr_.addr);
 }
 
 BucketTable::~BucketTable() {
     // Deallocate the bucket data
-    if (bucket_data_ != nullptr) {
+    if (owns_remote_memory_ && bucket_data_ != nullptr && rdma_mg_ != nullptr) {
         rdma_mg_->Deallocate_Remote_RDMA_Slot(bucket_data_, 0, BucketChunk);
         bucket_data_ = nullptr;
     }
@@ -55,10 +63,16 @@ BucketTable::~BucketTable() {
 // }
 
 Status BucketTable::get(const Slice& key, unsigned& offset) {
-    auto idx = key.Index() - min_key_.Index();
-    assert(idx >= 0 && idx < SLOT_NUM_PER_BUCKET);
+    uint64_t key_index = 0;
+    if (!key.TryGetIndex(&key_index) || key_index < min_key_index_ || key_index >= max_key_index_) {
+        return Status::InvalidArgument("BucketTable: key is not a valid key in this bucket");
+    }
+    const uint64_t idx = key_index - min_key_index_;
+    if (idx >= SLOT_NUM_PER_BUCKET) {
+        return Status::InvalidArgument("BucketTable: key exceeds bucket capacity");
+    }
     
-    unsigned byte_offset = idx * SLOT_SIZE;
+    const uint64_t byte_offset = idx * SLOT_SIZE;
     
     ibv_mr remote_mr = bucket_mr_;
     remote_mr.addr = static_cast<void*>(static_cast<char*>(bucket_mr_.addr) + byte_offset);

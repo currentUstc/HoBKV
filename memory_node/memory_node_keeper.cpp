@@ -239,7 +239,7 @@ TimberSaw::Memory_Node_Keeper::Memory_Node_Keeper(bool use_sub_compaction, uint3
 #else
     Compactor_pool_.SetBackgroundThreads(opts->max_background_compactions);
 #endif
-    Message_handler_pool_.SetBackgroundThreads(2);
+    Message_handler_pool_.SetBackgroundThreads(8);
     Persistency_bg_pool_.SetBackgroundThreads(1);
 
     // Set up the connection information.

@@ -15,9 +15,10 @@ node6 固定使用 16 个前台线程；node4 Server 使用与 RDMA 网卡相同
 - 独立 Get 在全部核心配置下均提升，提升范围为 2.5%～19.4%；10 核时提升 5.1%。
 - 混合负载在全部核心配置下均为正提升，提升范围为 1.4%～49.7%；10 核时提升 15.5%。
 - 4 核及以上时，优化版 node4 Server 的完整运行平均 CPU 通常低于 baseline；计算节点 CPU 略高。
-- 10 核范围查询 batch helper 恢复了 bucket 数据的可见性，MVCC v35 的 `bucket_errors=0`，但吞吐比
-  baseline 低 72.0%，尚未达到“性能损失不超过 30%”的目标。
-- 10 核是当前较均衡的展示配置：Put、Get、混合负载分别提升 40.1%、5.1%、15.5%。
+- 10 核范围查询经 MVCC、request-ID CQ 分发和 8 个 memory-side message workers 优化后，
+  `bucket_errors=0`，条目吞吐达到 48,470/s，仅比 baseline 低 7.4%。
+- 10 核是当前较均衡的展示配置：Put、Get、混合负载分别提升 40.1%、5.1%、15.5%，最终 scan
+  性能损失控制在 30% 以内。
 
 ## 2. Baseline 与两侧算力部署方式
 
@@ -225,3 +226,105 @@ MVCC 解决了 bucket 元数据与不可变 value 版本之间的并发一致性
 
 v35 原始数据：
 `/home/k8s/liuyang/dlsm-zippy-cpu-sweep-20260907/results-v26-lock-scope/range/post-helper-mvcc-v35/hotcold-10c`。
+
+## 11. main QP/CQ 按请求分发（v38）
+
+v35 中的 `main_send_cq_mutex` 把“发送请求、轮询 send completion、等待完整 reply”的全过程串行化。
+虽然该锁避免了多个线程互相消费 completion，但也使 16 个 scan 前台线程在共享 main QP 上实际串行。
+
+提交 `fde3ef3` 将其替换为按请求分发：
+
+- 每个共享 main-QP WR 分配唯一、非零的 `wr_id`；
+- 任意线程从共享 send CQ 取到 CQE 后，按 `wr_id` 将其交给正确的等待线程；
+- 仅单次 `ibv_poll_cq` 使用短临界区，不再在等待远端 reply 时持锁；
+- scan 的 `RDMA_Request` 与 `RDMA_Reply` 显式携带并校验 `request_id`；
+- flush helper、冷热迁移、心跳和 scan 不再由 `main_send_cq_mutex` 全程串行。
+
+在 node4 10 核、node6 16 前台线程、2 个 message workers 条件下：
+
+| 指标 | MVCC v35 | request-ID v38 | 改善 |
+|---|---:|---:|---:|
+| 返回条目 | 12,783 | 12,771 | 基本一致 |
+| bucket errors | 0 | 0 | 正常 |
+| 总耗时 | 871.629ms | 462.512ms | **-46.9%** |
+| 查询吞吐 | 183.6 query/s | 345.9 query/s | **+88.4%** |
+| 条目吞吐 | 14,666 entry/s | 27,612 entry/s | **+88.3%** |
+
+三个有效 request-ID 分发样本的 scan 总耗时为 483.653ms、446.933ms 和 462.512ms，平均
+464.366ms；平均条目吞吐约 27,522 entry/s，比 v35 提升 87.7%。这证明共享 CQ 的全程互斥是
+v35 的主要并发瓶颈之一。
+
+v38 原始数据：
+`/home/k8s/liuyang/dlsm-zippy-cpu-sweep-20260907/results-v26-lock-scope/range/main-cq-dispatch-v38-final/hotcold-10c`。
+
+## 12. 8 个 message workers 的最终结果（v39）
+
+提交 `da00691` 只把 memory node 的 `Message_handler_pool_` 从 2 个 worker 改为 8 个；其余测试条件保持
+不变：
+
+- node4 作为 memory/server node，绑定 RDMA 同 NUMA 的 10 个物理核心；
+- node6 作为 compute node，16 个前台线程；
+- value size 为 100KB；
+- load 300,000 条，约 30GB；
+- put 160,000 次，约 16GB，其中约一半 update、一半 insert；
+- 热请求比例 90%，集中在 3 个连续热点区间；
+- write buffer 保持 32MiB；
+- put 后等待后台 flush/compaction 完成，再开始 range scan；
+- scan 共 160 个查询，每个查询请求 64 个逻辑 key。
+
+### 12.1 Scan 性能
+
+| 指标 | Baseline | request-ID + 2 workers | request-ID + 8 workers |
+|---|---:|---:|---:|
+| 查询数 | 160 | 160 | 160 |
+| 返回条目 | 12,785 | 12,771 | 12,790 |
+| bucket errors | 不适用 | 0 | 0 |
+| 总耗时 | 244.296ms | 462.512ms | **263.876ms** |
+| 查询吞吐 | 654.9 query/s | 345.9 query/s | **606.3 query/s** |
+| 条目吞吐 | 52,334 entry/s | 27,612 entry/s | **48,470 entry/s** |
+| 相对 2 workers | — | — | **+75.5%** |
+| 相对 baseline | — | -47.2% | **-7.4%** |
+
+8 workers 已将优化版 scan 与 baseline 的条目吞吐差距从 47.2% 缩小到 7.4%，满足“性能损失在 30%
+以内”的目标。返回条目数差异为 5 条（约 0.04%），优化版 bucket error 为 0，且未发生 request-ID
+错配、重复 completion 或未标记 completion。
+
+### 12.2 Load 与 Put
+
+| 指标 | Baseline | request-ID + 2 workers | request-ID + 8 workers |
+|---|---:|---:|---:|
+| Load IOPS | 13,079 | 13,051 | 13,531 |
+| Put IOPS | 14,371 | 19,185 | 20,682 |
+| Put 平均延迟 | 1,090.581us | 802.136us | 747.965us |
+| Put P50 | 534.923us | 540.073us | 550.146us |
+| Put P95 | 2,118.810us | 2,381.401us | 2,186.210us |
+| Put P99 | 5,039.190us | 5,920.025us | 4,554.703us |
+
+这部分每个配置只有对应单次样本，Put 改善可作为观察结果，但不应仅据此归因于 worker 数量。
+
+### 12.3 CPU 与内存
+
+以下为整个 load、put、后台等待和 scan 运行期间的 1 秒粒度进程监控，不是仅 scan 阶段的采样：
+
+| 配置 | node4 平均 CPU | node4 峰值 CPU | node4 峰值 RSS | node6 平均 CPU | node6 峰值 RSS |
+|---|---:|---:|---:|---:|---:|
+| Baseline | 333.62% | 1001% | 88.52GiB | 188.51% | 3.59GiB |
+| request-ID + 2 workers | 336.68% | 985% | 88.54GiB | 218.83% | 3.89GiB |
+| request-ID + 8 workers | 336.47% | 966% | 88.58GiB | 210.80% | 3.83GiB |
+
+2→8 workers 后，node4 整轮平均 CPU 从 336.68% 变为 336.47%，基本不变；scan 吞吐却提升 75.5%。
+这说明主要收益来自减少 helper 请求排队并利用已有并发空间，而不是提高整轮 CPU 消耗。由于最终 scan
+只持续 263.876ms，短于 1 秒采样周期，现有日志不能可靠给出仅 scan 阶段的 CPU。
+
+### 12.4 最终结论与剩余瓶颈
+
+最终推荐版本为 `da00691`，它包含：flush 阶段冷热分流、batch scan helper、MVCC 版本链、共享 main CQ
+按 request ID 分发，以及 8 个 memory-side message workers。在当前 10 核 server 配置下，scan 相对
+baseline 仅低 7.4%，同时 bucket error 为 0。
+
+剩余主要开销是 node4 的 scan helper 仍线性遍历 `latest_bucket_sequence_by_key_`。如果继续优化，应建立
+按 key、bucket 或 subrange 有序的范围索引，使每次 scan 只访问命中区间；目前没有必要继续盲目增加
+worker 数量。
+
+v39 最终原始数据：
+`/home/k8s/liuyang/dlsm-zippy-cpu-sweep-20260907/results-v26-lock-scope/range/main-cq-8workers-v39/hotcold-10c`。

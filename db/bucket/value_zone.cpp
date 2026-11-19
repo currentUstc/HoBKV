@@ -1,6 +1,9 @@
 #include "value_zone.h"
-#include <cstring>
 #include <cassert>
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <unordered_map>
 #include <unordered_set>
 #include "util/coding.h"
@@ -12,6 +15,29 @@ constexpr size_t kValueZoneAlignment = VALUE_ZONE_OFFSET_UNIT;
 
 size_t AlignUp(size_t value, size_t alignment) {
     return (value + alignment - 1) / alignment * alignment;
+}
+
+size_t ValueZonePrefetchBytes() {
+    static const size_t bytes = [] {
+        constexpr size_t kHeaderBytes = sizeof(uint64_t);
+        constexpr size_t kDefaultPrefetchBytes = 1024;
+        const char* configured = std::getenv("DLSM_BUCKET_PREFETCH_BYTES");
+        if (configured == nullptr || *configured == '\0') {
+            return kDefaultPrefetchBytes;
+        }
+        errno = 0;
+        char* end = nullptr;
+        const unsigned long long parsed = std::strtoull(configured, &end, 10);
+        if (errno != 0 || end == configured || *end != '\0' ||
+            parsed < kHeaderBytes || parsed > VALUE_ZONE_ALLOC_SIZE) {
+            std::fprintf(stderr,
+                         "Ignoring invalid DLSM_BUCKET_PREFETCH_BYTES=%s; using %zu\n",
+                         configured, kDefaultPrefetchBytes);
+            return kDefaultPrefetchBytes;
+        }
+        return static_cast<size_t>(parsed);
+    }();
+    return bytes;
 }
 }  // namespace
 
@@ -209,83 +235,86 @@ Status ValueZone::GetWithSequence(uint64_t offset, Slice& value, uint64_t* seque
         return Status::IOError("ValueZone: offset exceeds allocated memory");
     }
 
-    // 第二步：第一次 RDMA Read - 读取 total_size (8B)
+    // Fetch the header and a small value together to avoid a second synchronous
+    // RDMA read for the body. Larger records and MR-boundary cases retain the
+    // chunked fallback below. DLSM_BUCKET_PREFETCH_BYTES=8 selects the original
+    // header-only path for diagnostic comparisons.
+    const size_t value_zone_prefetch_bytes = ValueZonePrefetchBytes();
+    const size_t bytes_remaining_in_first_mr = VALUE_ZONE_ALLOC_SIZE - offset_in_mr;
+
     remote_mr.addr = static_cast<void*>(static_cast<char*>(remote_mr.addr) + offset_in_mr);
-    
-    // 获取本地读取缓冲区
+
     ibv_mr* local_mr = rdma_mg_->Get_local_read_mr();
-    
-    // 读取 total_size (8B)
-    int ret = rdma_mg_->RDMA_Read(&remote_mr, local_mr, 8,
+
+    const size_t prefetch_size =
+        std::min({value_zone_prefetch_bytes, bytes_remaining_in_first_mr,
+                  static_cast<size_t>(local_mr->length)});
+    if (prefetch_size < sizeof(uint64_t)) {
+        return Status::IOError("ValueZone: local RDMA read buffer is too small");
+    }
+    int ret = rdma_mg_->RDMA_Read(&remote_mr, local_mr, prefetch_size,
                                   "read_local", IBV_SEND_SIGNALED, 1, 0);
     if (ret != 0) {
-        return Status::IOError("ValueZone: First RDMA Read failed (total_size)");
+        return Status::IOError("ValueZone: prefetch RDMA Read failed");
     }
-    
-    // 解析 total_size
+
     uint64_t total_size;
     memcpy(&total_size, local_mr->addr, 8);
-    
+
     if (total_size < 56 || total_size > 100 * 1024 * 1024) {  // 基本合法性检查
         return Status::Corruption("ValueZone: Invalid total_size");
     }
-    
-    // 第三步：第二次 RDMA Read - 根据 total_size 读取完整数据
-    // total_size 包含了从 key_data 到 prev 的所有数据
-    // 需要读取的大小 = total_size - 8 (不包括 total_size 自身)
+
     size_t data_to_read = total_size - 8;
-    
-    // 更新偏移量到 key_data 位置（跳过 total_size 的 8B）
-    offset_in_mr += 8;
-    if (offset_in_mr >= VALUE_ZONE_ALLOC_SIZE) {
-        mr_index++;
-        offset_in_mr = 0;
-        if (!snapshot_remote_mr(mr_index, &remote_mr)) {
-            return Status::IOError("ValueZone: data spans beyond allocated memory");
-        }
-    }
-    
-    // 分配缓冲区存储读取的数据
-    char* data_buffer = new char[data_to_read];
-    
-    // 处理跨 MR 边界的情况
-    size_t bytes_read = 0;
-    while (bytes_read < data_to_read) {
-        if (!snapshot_remote_mr(mr_index, &remote_mr)) {
-            delete[] data_buffer;
-            return Status::IOError("ValueZone: data spans beyond allocated memory");
-        }
-        
-        // 计算本次读取大小
-        size_t bytes_remaining_in_mr = VALUE_ZONE_ALLOC_SIZE - offset_in_mr;
-        size_t bytes_to_read_now =
-            std::min({bytes_remaining_in_mr, data_to_read - bytes_read, static_cast<size_t>(local_mr->length)});
-        if (bytes_to_read_now == 0) {
-            delete[] data_buffer;
-            return Status::IOError("ValueZone: local RDMA read buffer has zero length");
-        }
-        
-        // 执行 RDMA Read
-        remote_mr.addr = static_cast<void*>(static_cast<char*>(remote_mr.addr) + offset_in_mr);
-        
-        ret = rdma_mg_->RDMA_Read(&remote_mr, local_mr, bytes_to_read_now,
-                                  "read_local", IBV_SEND_SIGNALED, 1, 0);
-        if (ret != 0) {
-            delete[] data_buffer;
-            return Status::IOError("ValueZone: Second RDMA Read failed");
-        }
-        
-        // 复制到缓冲区
-        memcpy(data_buffer + bytes_read, local_mr->addr, bytes_to_read_now);
-        bytes_read += bytes_to_read_now;
-        
-        offset_in_mr += bytes_to_read_now;
-        if (offset_in_mr == VALUE_ZONE_ALLOC_SIZE) {
+    const char* data_buffer = nullptr;
+    std::unique_ptr<char[]> fallback_buffer;
+    if (total_size <= prefetch_size) {
+        data_buffer = static_cast<const char*>(local_mr->addr) + sizeof(uint64_t);
+    } else {
+        // The record did not fit in the speculative window. Read the complete
+        // body using the original chunked path, including MR-boundary support.
+        offset_in_mr += sizeof(uint64_t);
+        if (offset_in_mr >= VALUE_ZONE_ALLOC_SIZE) {
             mr_index++;
             offset_in_mr = 0;
+            if (!snapshot_remote_mr(mr_index, &remote_mr)) {
+                return Status::IOError("ValueZone: data spans beyond allocated memory");
+            }
         }
+
+        fallback_buffer.reset(new char[data_to_read]);
+        size_t bytes_read = 0;
+        while (bytes_read < data_to_read) {
+            if (!snapshot_remote_mr(mr_index, &remote_mr)) {
+                return Status::IOError("ValueZone: data spans beyond allocated memory");
+            }
+
+            const size_t bytes_remaining_in_mr = VALUE_ZONE_ALLOC_SIZE - offset_in_mr;
+            const size_t bytes_to_read_now =
+                std::min({bytes_remaining_in_mr, data_to_read - bytes_read,
+                          static_cast<size_t>(local_mr->length)});
+            if (bytes_to_read_now == 0) {
+                return Status::IOError("ValueZone: local RDMA read buffer has zero length");
+            }
+
+            remote_mr.addr = static_cast<void*>(static_cast<char*>(remote_mr.addr) + offset_in_mr);
+            ret = rdma_mg_->RDMA_Read(&remote_mr, local_mr, bytes_to_read_now,
+                                      "read_local", IBV_SEND_SIGNALED, 1, 0);
+            if (ret != 0) {
+                return Status::IOError("ValueZone: record RDMA Read failed");
+            }
+
+            memcpy(fallback_buffer.get() + bytes_read, local_mr->addr, bytes_to_read_now);
+            bytes_read += bytes_to_read_now;
+            offset_in_mr += bytes_to_read_now;
+            if (offset_in_mr == VALUE_ZONE_ALLOC_SIZE) {
+                mr_index++;
+                offset_in_mr = 0;
+            }
+        }
+        data_buffer = fallback_buffer.get();
     }
-    
+
     // data_buffer starts immediately after total_size.
     if (sequence_number != nullptr) {
         *sequence_number = DecodeFixed64(data_buffer + 8);
@@ -300,7 +329,6 @@ Status ValueZone::GetWithSequence(uint64_t offset, Slice& value, uint64_t* seque
     const size_t parse_offset = 40 + padded_key_size;
     if (parse_offset + sizeof(uint64_t) > data_to_read ||
         value_size > data_to_read - parse_offset - sizeof(uint64_t)) {
-        delete[] data_buffer;
         return Status::Corruption("ValueZone: invalid key/value sizes");
     }
     
@@ -309,9 +337,6 @@ Status ValueZone::GetWithSequence(uint64_t offset, Slice& value, uint64_t* seque
     if (value_size > 0) {
         memcpy(value_buffer, data_buffer + parse_offset, value_size);
     }
-    
-    // 清理临时缓冲区
-    delete[] data_buffer;
     
     // 设置返回值（忽略 next 和 prev）
     value = Slice(value_buffer, value_size);

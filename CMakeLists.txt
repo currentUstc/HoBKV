@@ -443,7 +443,7 @@ if(TimberSaw_BUILD_TESTS)
 #    TimberSaw_test("db/skiplist_test.cc")
 #    TimberSaw_test("db/version_edit_test.cc")
 #    TimberSaw_test("db/version_set_test.cc")
-#    TimberSaw_test("db/write_batch_test.cc")
+    TimberSaw_test("db/write_batch_test.cc")
 #
 #    TimberSaw_test("helpers/memenv/memenv_test.cc")
 #

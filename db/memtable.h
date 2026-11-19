@@ -12,7 +12,6 @@
 //  #define MEMTABLE_SEQ_SIZE 610081
 #include "db/dbformat.h"
 #include "db/inlineskiplist.h"
-#include <mutex>
 #include <string>
 
 #include "TimberSaw/db.h"
@@ -158,7 +157,6 @@ private:
     int64_t first_seq;
     std::atomic<int64_t> largest_seq_till_now = 0;
     int64_t largest_seq_supposed;
-    std::mutex table_write_mutex_;
 };
 
 }  // namespace TimberSaw

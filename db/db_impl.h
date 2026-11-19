@@ -8,6 +8,7 @@
 #include "db/dbformat.h"
 #include "db/log_writer.h"
 #include "db/snapshot.h"
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -153,7 +154,14 @@ public:
     // long double server_cpu_percent = 0.0;
     //  void Wait_for_client_message_hanlding_setup();
     bool IsHotKey(const Slice& user_key);
+    bool IsHotKey(const Slice& user_key, uint64_t hot_region_mask) const;
+    uint64_t GetHotRegionMask() const {
+        return hot_region_mask_.load(std::memory_order_acquire);
+    }
     void RecordWriteAccess(const Slice& user_key);
+    void RecordFlushRouting(uint64_t hot_entries, uint64_t hot_bytes,
+                            uint64_t cold_entries, uint64_t cold_bytes,
+                            bool bucket_flush_failed);
     std::shared_ptr<ValueZone> GetValueZone() const { return value_zone_; }
     std::shared_ptr<RDMA_Manager> GetRDMA_Manager() const { return env_ ? env_->rdma_mg : nullptr; }
     uint8_t GetShardTargetNodeId() const { return shard_target_node_id; }
@@ -218,6 +226,7 @@ private:
     long double RequestRemoteUtilization();
     //  void ActivateRemoteCPURefresh();
     void CleanupCompaction(CompactionState* compact) EXCLUSIVE_LOCKS_REQUIRED(undefine_mutex);
+    void LogCompactionInputRanges(Compaction* compaction);
     Status DoCompactionWork(CompactionState* compact) EXCLUSIVE_LOCKS_REQUIRED(undefine_mutex);
     void ProcessKeyValueCompaction(SubcompactionState* sub_compact);
     // TODO: We could probably use corotine to do the compaction because the compaction for
@@ -248,6 +257,8 @@ private:
 
     
     void RecordKeyAccess(const Slice& key, bool is_write);
+    bool ShouldSampleHotness();
+    void RecordSampledKeyAccess(const Slice& key, bool is_write);
     
     // 热度评分和冷热区域调整
     void UpdateHotnessScore();
@@ -372,8 +383,9 @@ private:
     std::mutex hot_stats_mutex_;                           // 保护热度统计和 LRU 列表
     std::list<size_t> hot_region_lru_;                     // LRU 列表，存储热区域的 shard 索引
     std::unordered_set<size_t> hot_region_set_;            // 热区域集合，便于快速查找
+    std::atomic<uint64_t> hot_region_mask_{0};              // lock-free flush-time hot-region snapshot
     std::atomic<bool> hotness_adjustment_scheduled_{false}; // 是否已调度热度调整任务
-    uint64_t last_hotness_check_time_ = 0;                 // 上次热度检查时间（微秒）
+    std::atomic<uint64_t> last_hotness_check_time_{0};      // 上次热度检查时间（微秒）
     
     struct HotnessConfig {
         uint64_t check_interval_us = 1000000;  // 检查间隔：1秒
@@ -447,6 +459,15 @@ private:
     };
     std::mutex bucket_meta_mu_;
     std::unordered_map<size_t, BucketMigrationMeta> bucket_migration_meta_by_shard_;
+    std::atomic<uint64_t> bucket_get_attempts_{0};
+    std::atomic<uint64_t> bucket_get_hits_{0};
+    std::atomic<uint64_t> bucket_get_misses_{0};
+    std::atomic<uint64_t> bucket_sst_fallbacks_{0};
+    std::atomic<uint64_t> bucket_flush_hot_entries_{0};
+    std::atomic<uint64_t> bucket_flush_hot_bytes_{0};
+    std::atomic<uint64_t> bucket_flush_cold_entries_{0};
+    std::atomic<uint64_t> bucket_flush_cold_bytes_{0};
+    std::atomic<uint64_t> bucket_flush_failures_{0};
 
 #ifdef PROCESSANALYSIS
     std::atomic<size_t> Total_time_elapse;

@@ -245,18 +245,19 @@ RDMA_Manager::~RDMA_Manager() {
     }
 }
 bool RDMA_Manager::poll_reply_buffer(RDMA_Reply* rdma_reply) {
-    volatile bool* check_byte = &(rdma_reply->received);
-    //  size_t counter = 0;
-    while (!*check_byte) {
-        _mm_clflush(check_byte);
-        asm volatile("sfence\n" : :);
-        asm volatile("lfence\n" : :);
-        asm volatile("mfence\n" : :);
-        //    counter++;
-        //    if (counter == 1000000){
-        //      printf("Polling not get a result\n");
-        //      return false;
-        //    }
+    // RDMA DMA writes are cache coherent on the target x86 hosts. Flushing the
+    // cache line and executing three full fences for every failed poll made
+    // background flush workers consume entire compute cores while the memory
+    // node processed bucket metadata. Use an acquire load, a processor pause,
+    // and periodically yield so foreground writers can keep their CPU share.
+    constexpr uint32_t kSpinsBeforeYield = 4096;
+    uint32_t spins = 0;
+    while (!__atomic_load_n(&rdma_reply->received, __ATOMIC_ACQUIRE)) {
+        asm volatile("pause" ::: "memory");
+        if (++spins == kSpinsBeforeYield) {
+            std::this_thread::yield();
+            spins = 0;
+        }
     }
     return true;
 }

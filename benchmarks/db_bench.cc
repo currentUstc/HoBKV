@@ -82,6 +82,51 @@ static uint64_t MixGraphPhysicalKey(uint64_t ordinal, uint64_t total_keys, size_
     return static_cast<uint64_t>((static_cast<__uint128_t>(ordinal) * key_space) / total_keys);
 }
 
+class MixGraphHotColdLoadMapper {
+public:
+    MixGraphHotColdLoadMapper(uint64_t total_keys, size_t key_size) {
+        counts_.fill(0);
+        const uint64_t hot_total = total_keys * 90 / 100;
+        counts_[2] = hot_total * 70 / 100;
+        counts_[14] = hot_total * 20 / 100;
+        counts_[25] = hot_total - counts_[2] - counts_[14];
+        uint64_t cold_left = total_keys - hot_total;
+        uint64_t cold_index = 0;
+        for (size_t range = 0; range < counts_.size(); ++range) {
+            if (range == 2 || range == 14 || range == 25) continue;
+            counts_[range] = (total_keys - hot_total) / 27 + (cold_left > 0 ? 1 : 0);
+            if (cold_left > 0) --cold_left;
+            ++cold_index;
+        }
+        (void)cold_index;
+        prefix_[0] = 0;
+        for (size_t range = 0; range < counts_.size(); ++range) {
+            prefix_[range + 1] = prefix_[range] + counts_[range];
+        }
+        key_space_ = GetMaxSliceCompatibleKeyValue(key_size) + 1;
+    }
+
+    uint64_t PhysicalKey(uint64_t ordinal) const {
+        const auto it = std::upper_bound(prefix_.begin(), prefix_.end(), ordinal);
+        const size_t range = static_cast<size_t>(it - prefix_.begin() - 1);
+        const uint64_t local_ordinal = ordinal - prefix_[range];
+        const uint64_t range_start = static_cast<uint64_t>(
+            (static_cast<__uint128_t>(range) * key_space_) / counts_.size());
+        const uint64_t range_end = static_cast<uint64_t>(
+            (static_cast<__uint128_t>(range + 1) * key_space_) / counts_.size());
+        const uint64_t range_width = range_end - range_start;
+        return range_start + static_cast<uint64_t>(
+            (static_cast<__uint128_t>(local_ordinal) * range_width) / counts_[range]);
+    }
+
+    const std::array<uint64_t, 30>& counts() const { return counts_; }
+
+private:
+    std::array<uint64_t, 30> counts_{};
+    std::array<uint64_t, 31> prefix_{};
+    uint64_t key_space_ = 0;
+};
+
 // Return an unused physical key immediately after a loaded key.  The 50GB
 // experiment has far fewer logical keys than physical key slots, so this key
 // is guaranteed to lie before the next loaded key and can be used for a true
@@ -193,6 +238,7 @@ static bool FLAGS_reuse_logs = false;
 
 // Whether DBImpl may classify hot regions and flush them to bucket/value zone.
 static bool FLAGS_enable_hot_cold = true;
+static bool FLAGS_hot_cold_load = false;
 
 // Force the current memtable to flush and wait for all flush/compaction work
 // after the load and put-only phases. This keeps the following phase from
@@ -992,6 +1038,11 @@ public:
                 }
 #endif
                 DEBUG("The benchmark start.\n");
+                if (method == &Benchmark::PutMixGraph) {
+                    std::printf("BENCH_PHASE name=putmixgraph state=start ts_us=%llu\n",
+                                static_cast<unsigned long long>(g_env->NowMicros()));
+                    std::fflush(stdout);
+                }
                 RunBenchmark(num_threads, name, method);
                 DEBUG("Benchmark finished\n");
                 if (FLAGS_wait_between_phases &&
@@ -1004,6 +1055,10 @@ public:
                     const uint64_t wait_elapsed_us = g_env->NowMicros() - wait_start_us;
                     std::printf("background_wait_after_%s: end elapsed_us=%llu\n", name.ToString().c_str(),
                                 static_cast<unsigned long long>(wait_elapsed_us));
+                    if (method == &Benchmark::PutMixGraph) {
+                        std::printf("BENCH_PHASE name=putmixgraph state=end ts_us=%llu\n",
+                                    static_cast<unsigned long long>(g_env->NowMicros()));
+                    }
                     std::fflush(stdout);
                 }
             }
@@ -1070,6 +1125,20 @@ private:
     void RunBenchmark(int n, Slice name, void (Benchmark::*method)(ThreadState*)) {
         //    printf("Bechmark start\n");
         if (method == &Benchmark::WriteRandom || method == &Benchmark::WriteRandomSharded) Validation_Write();
+        if (method == &Benchmark::WriteMixGraphKeys && FLAGS_hot_cold_load) {
+            MixGraphHotColdLoadMapper mapper(static_cast<uint64_t>(FLAGS_num) * FLAGS_threads,
+                                             static_cast<size_t>(FLAGS_key_size));
+            const auto& counts = mapper.counts();
+            std::printf("fillmixgraph_hot_cold_load: entries=%llu hot=%llu cold=%llu "
+                        "regions_2_14_25=%llu/%llu/%llu\n",
+                        static_cast<unsigned long long>(FLAGS_num) * FLAGS_threads,
+                        static_cast<unsigned long long>(counts[2] + counts[14] + counts[25]),
+                        static_cast<unsigned long long>(FLAGS_num * FLAGS_threads - counts[2] - counts[14] - counts[25]),
+                        static_cast<unsigned long long>(counts[2]),
+                        static_cast<unsigned long long>(counts[14]),
+                        static_cast<unsigned long long>(counts[25]));
+            std::fflush(stdout);
+        }
         const bool is_mixgraph_phase = method == &Benchmark::MixGraph || method == &Benchmark::PutMixGraph ||
                                        method == &Benchmark::GetMixGraph;
         if (method == &Benchmark::RangeReadRandom) {
@@ -1443,13 +1512,17 @@ private:
         std::unique_ptr<const char[]> key_guard;
         Slice key = AllocateKey(&key_guard);
         const uint64_t total_keys = static_cast<uint64_t>(FLAGS_num) * FLAGS_threads;
+        MixGraphHotColdLoadMapper hot_cold_mapper(total_keys, key.size());
         int64_t bytes = 0;
         for (int i = 0; i < num_; i += entries_per_batch_) {
             batch.Clear();
             for (int j = 0; j < entries_per_batch_; ++j) {
                 const uint64_t logical_index = static_cast<uint64_t>(thread->tid) * num_ + i + j;
                 const uint64_t ordinal = total_keys - 1 - logical_index;
-                GenerateKeyFromInt(MixGraphPhysicalKey(ordinal, total_keys, key.size()), &key);
+                const uint64_t physical_key = FLAGS_hot_cold_load
+                                                  ? hot_cold_mapper.PhysicalKey(ordinal)
+                                                  : MixGraphPhysicalKey(ordinal, total_keys, key.size());
+                GenerateKeyFromInt(physical_key, &key);
                 batch.Put(key, gen.Generate(value_size_));
                 bytes += value_size_ + key.size();
                 thread->stats.FinishedSingleOp();
@@ -2315,6 +2388,8 @@ int main(int argc, char** argv) {
             FLAGS_use_existing_db = n;
         } else if (sscanf(argv[i], "--enable_hot_cold=%d%c", &n, &junk) == 1 && (n == 0 || n == 1)) {
             FLAGS_enable_hot_cold = n;
+        } else if (sscanf(argv[i], "--hot_cold_load=%d%c", &n, &junk) == 1 && (n == 0 || n == 1)) {
+            FLAGS_hot_cold_load = n;
         } else if (sscanf(argv[i], "--wait_between_phases=%d%c", &n, &junk) == 1 && (n == 0 || n == 1)) {
             FLAGS_wait_between_phases = n;
         } else if (sscanf(argv[i], "--fixed_compute_shards_num=%d%c", &n, &junk) == 1) {

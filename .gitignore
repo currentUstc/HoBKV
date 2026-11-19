@@ -23,3 +23,6 @@ out/
 
 connection*
 *.sh
+
+# Local cluster configuration may contain private hostnames or addresses.
+/connection.conf

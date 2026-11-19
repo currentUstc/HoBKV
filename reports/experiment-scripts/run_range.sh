@@ -8,8 +8,8 @@ case "$mode" in
   *) echo "invalid mode: $mode" >&2; exit 2 ;;
 esac
 
-node4=${NODE4:-REDACTED}
-node6=${NODE6:-REDACTED}
+node4=${NODE4:?Set NODE4 to the memory-node address}
+node6=${NODE6:?Set NODE6 to the compute-node address}
 remote_root=${REMOTE_ROOT:-/tmp/dlsm-hotcold-20260906-1349}
 server_bin=${SERVER_BIN:-$remote_root/build/Server.bucket-scan-mvcc-v35}
 compute_bin=${COMPUTE_BIN:-$remote_root/build/db_bench.bucket-scan-mvcc-v35}

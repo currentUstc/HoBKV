@@ -239,7 +239,16 @@ TimberSaw::Memory_Node_Keeper::Memory_Node_Keeper(bool use_sub_compaction, uint3
 #else
     Compactor_pool_.SetBackgroundThreads(opts->max_background_compactions);
 #endif
-    Message_handler_pool_.SetBackgroundThreads(8);
+    int message_workers = 8;
+    if (const char* configured_workers = std::getenv("DLSM_MESSAGE_WORKERS")) {
+        char* end = nullptr;
+        const long parsed = std::strtol(configured_workers, &end, 10);
+        if (end != configured_workers && *end == '\0' && parsed > 0 && parsed <= 256) {
+            message_workers = static_cast<int>(parsed);
+        }
+    }
+    Message_handler_pool_.SetBackgroundThreads(message_workers);
+    std::printf("Configured message handler workers: %d\n", message_workers);
     Persistency_bg_pool_.SetBackgroundThreads(1);
 
     // Set up the connection information.
@@ -361,15 +370,27 @@ void Memory_Node_Keeper::RecomputeBucketMigrationMeta(BucketMigrationMeta* meta)
     meta->subrange_overlap_counts.assign(kBucketSubrangeCount, 0);
     meta->subrange_bitmap.assign(kBucketSubrangeCount, 0);
 
-    InternalKey begin_internal(std::to_string(meta->min_key), kMaxSequenceNumber, kTypeValue);
-    InternalKey end_internal(std::to_string(meta->max_key - 1), 0, kTypeDeletion);
     std::unordered_set<std::string> visited_files;
 
     std::lock_guard<std::mutex> lock(versionset_mtx);
     Version* current = versions_->current();
     for (int level = 0; level < config::kNumLevels; ++level) {
         std::vector<std::shared_ptr<RemoteMemTableMetaData>> inputs;
-        current->GetOverlappingInputs(level, &begin_internal, &end_internal, &inputs);
+        // The benchmark stores fixed-width, zero-padded decimal user keys.
+        // Constructing lookup bounds with std::to_string() loses that width
+        // ("134217728" vs "00000000000134217728"), so the bytewise
+        // comparator can incorrectly report that no SST overlaps the range.
+        // Enumerate the level and perform the range test numerically instead.
+        // This path runs only when a shard changes temperature, so scanning
+        // the level is preferable to publishing incorrect bucket-only state.
+        if (!current->GetOverlappingInputs(level, nullptr, nullptr, &inputs)) {
+            // A file is currently under compaction. Be conservative until a
+            // later compaction update recomputes the bitmap.
+            std::fill(meta->subrange_overlap_counts.begin(),
+                      meta->subrange_overlap_counts.end(), 1);
+            RefreshBucketBitmap(meta);
+            return;
+        }
         for (const auto& file : inputs) {
             if (!file) {
                 continue;
@@ -487,6 +508,12 @@ void Memory_Node_Keeper::UpdateBucketMigrationMetaAfterCompaction(Compaction* co
 //    message_handler_pool_.Schedule(background_work_function, background_work_arg);
 //  }
 void Memory_Node_Keeper::SetBackgroundThreads(int num, ThreadPoolType type) {
+    assert(type == ThreadPoolType::CompactionThreadPool);
+    (void)type;
+    assert(num > 0);
+    configured_compaction_threads_ = num;
+    opts->max_background_compactions = num;
+    opts->MaxSubcompaction = num;
     Compactor_pool_.SetBackgroundThreads(num);
 }
 //  void Memory_Node_Keeper::MaybeScheduleCompaction(std::string& client_ip) {
@@ -1125,7 +1152,10 @@ Status Memory_Node_Keeper::DoCompactionWorkWithSubcompaction(CompactionState* co
     auto sizes = c->GetSizes();
     assert(boundaries->size() == sizes->size() - 1);
     //  int subcompaction_num = std::min((int)c->GetBoundariesNum(), config::MaxSubcompaction);
-    if (boundaries->size() <= opts->MaxSubcompaction) {
+    // boundaries has one fewer element than the number of ranges/workers.
+    // Comparing the boundary count directly allowed MaxSubcompaction + 1
+    // worker threads (for example, 3 workers with a configured limit of 2).
+    if (sizes->size() <= static_cast<size_t>(opts->MaxSubcompaction)) {
         for (size_t i = 0; i <= boundaries->size(); i++) {
             Slice* start = i == 0 ? nullptr : &(*boundaries)[i - 1];
             Slice* end = i == boundaries->size() ? nullptr : &(*boundaries)[i];
@@ -1165,6 +1195,10 @@ Status Memory_Node_Keeper::DoCompactionWorkWithSubcompaction(CompactionState* co
             Slice* end = i == boundaries->size() ? nullptr : &(*boundaries)[i];
             compact->sub_compact_states.emplace_back(c, start, end, range_size);
         }
+    }
+    if (compact->sub_compact_states.size() >
+        static_cast<size_t>(opts->MaxSubcompaction)) {
+        return Status::Corruption("subcompaction plan exceeds configured worker limit");
     }
     printf("Subcompaction number is %zu", compact->sub_compact_states.size());
     const size_t num_threads = compact->sub_compact_states.size();
@@ -2460,13 +2494,20 @@ void Memory_Node_Keeper::flush_helper_handler(void* arg) {
         std::lock_guard<std::mutex> lock(value_zone_mr_mu_);
         value_zone_mrs = value_zone_mrs_;
     }
-    std::unique_lock<std::shared_mutex> update_lock(bucket_update_mu_);
+    struct PendingBucketUpdate {
+        uint64_t key_index;
+        uint64_t offset_units;
+        SequenceNumber sequence;
+        uint64_t slot_idx;
+    };
+    std::array<std::vector<PendingBucketUpdate>, BUCKET_NUMBER> updates_by_shard;
     for (size_t i = 0; i < kv_count; ++i) {
         const uint64_t key_index = DecodeFixed64(ptr);
         const uint64_t offset_units = DecodeFixed64(ptr + sizeof(uint64_t));
         const SequenceNumber sequence = DecodeFixed64(ptr + sizeof(uint64_t) * 2);
         const uint64_t bucket_idx = key_index / SLOT_NUM_PER_BUCKET;
         const uint64_t slot_idx = key_index % SLOT_NUM_PER_BUCKET;
+        ptr += pair_size;
 
         if (bucket_idx >= BUCKET_NUMBER) {
             if (error_count < kMaxErrorLogs) {
@@ -2474,7 +2515,16 @@ void Memory_Node_Keeper::flush_helper_handler(void* arg) {
                              static_cast<unsigned long long>(key_index));
             }
             error_count++;
-            ptr += pair_size;
+            continue;
+        }
+
+        updates_by_shard[bucket_idx].push_back(
+            {key_index, offset_units, sequence, slot_idx});
+    }
+
+    for (size_t bucket_idx = 0; bucket_idx < updates_by_shard.size(); ++bucket_idx) {
+        auto& pending = updates_by_shard[bucket_idx];
+        if (pending.empty()) {
             continue;
         }
 
@@ -2484,44 +2534,49 @@ void Memory_Node_Keeper::flush_helper_handler(void* arg) {
                 std::fprintf(stderr, "flush_helper: bucket %llu not registered\n",
                              static_cast<unsigned long long>(bucket_idx));
             }
-            error_count++;
-            ptr += pair_size;
+            error_count += pending.size();
             continue;
         }
 
-        auto sequence_it = latest_bucket_sequence_by_key_.find(key_index);
-        if (sequence_it != latest_bucket_sequence_by_key_.end() && sequence < sequence_it->second) {
-            ptr += pair_size;
-            continue;
-        }
-
-        uint64_t previous_offset_units = 0;
-        Status read_status = builder->ReadSlot(slot_idx, &previous_offset_units);
-        if (!read_status.ok() ||
-            !PatchValueZonePreviousOffset(value_zone_mrs, offset_units, key_index, sequence,
-                                          previous_offset_units)) {
-            if (error_count < kMaxErrorLogs) {
-                std::fprintf(stderr,
-                             "flush_helper: failed to link MVCC version key=%llu seq=%llu prev=%llu\n",
-                             static_cast<unsigned long long>(key_index),
-                             static_cast<unsigned long long>(sequence),
-                             static_cast<unsigned long long>(previous_offset_units));
+        std::unique_lock<std::shared_mutex> update_lock(
+            bucket_update_mu_by_shard_[bucket_idx]);
+        auto& latest_sequences = latest_bucket_sequence_by_shard_[bucket_idx];
+        for (const PendingBucketUpdate& update : pending) {
+            auto sequence_it = latest_sequences.find(update.key_index);
+            if (sequence_it != latest_sequences.end() &&
+                update.sequence < sequence_it->second) {
+                continue;
             }
-            error_count++;
-            ptr += pair_size;
-            continue;
-        }
 
-        Status s = builder->UpdateSlot(slot_idx, offset_units);
-        if (!s.ok()) {
-            if (error_count < kMaxErrorLogs) {
-                std::fprintf(stderr, "flush_helper: update slot failed: %s\n", s.ToString().c_str());
+            uint64_t previous_offset_units = 0;
+            Status read_status = builder->ReadSlot(update.slot_idx, &previous_offset_units);
+            if (!read_status.ok() ||
+                !PatchValueZonePreviousOffset(value_zone_mrs, update.offset_units,
+                                              update.key_index, update.sequence,
+                                              previous_offset_units)) {
+                if (error_count < kMaxErrorLogs) {
+                    std::fprintf(
+                        stderr,
+                        "flush_helper: failed to link MVCC version key=%llu seq=%llu prev=%llu\n",
+                        static_cast<unsigned long long>(update.key_index),
+                        static_cast<unsigned long long>(update.sequence),
+                        static_cast<unsigned long long>(previous_offset_units));
+                }
+                error_count++;
+                continue;
             }
-            error_count++;
-        } else {
-            latest_bucket_sequence_by_key_[key_index] = sequence;
+
+            Status s = builder->UpdateSlot(update.slot_idx, update.offset_units);
+            if (!s.ok()) {
+                if (error_count < kMaxErrorLogs) {
+                    std::fprintf(stderr, "flush_helper: update slot failed: %s\n",
+                                 s.ToString().c_str());
+                }
+                error_count++;
+            } else {
+                latest_sequences[update.key_index] = update.sequence;
+            }
         }
-        ptr += pair_size;
     }
 
     ibv_mr send_mr = {};
@@ -2572,21 +2627,25 @@ void Memory_Node_Keeper::bucket_scan_handler(void* arg) {
         // MVCC snapshot: only key discovery and bucket-head capture require
         // metadata synchronization. Version records are immutable and are
         // decoded after releasing this shared lock.
-        std::shared_lock<std::shared_mutex> update_lock(bucket_update_mu_);
-        for (const auto& key_sequence : latest_bucket_sequence_by_key_) {
-            const uint64_t key_index = key_sequence.first;
-            if (key_index < std::max(scan.start_key, scan.cursor_key) || key_index >= scan.end_key) {
-                continue;
-            }
-            const uint64_t bucket_idx = key_index / SLOT_NUM_PER_BUCKET;
-            const uint64_t slot_idx = key_index % SLOT_NUM_PER_BUCKET;
+        for (size_t bucket_idx = 0; bucket_idx < BUCKET_NUMBER; ++bucket_idx) {
+            std::shared_lock<std::shared_mutex> update_lock(
+                bucket_update_mu_by_shard_[bucket_idx]);
             auto builder = GetBucketTableBuilder(bucket_idx);
-            uint64_t offset_units = 0;
-            if (!builder || !builder->ReadSlot(slot_idx, &offset_units).ok() || offset_units == 0) {
-                ++error_count;
-                continue;
+            for (const auto& key_sequence : latest_bucket_sequence_by_shard_[bucket_idx]) {
+                const uint64_t key_index = key_sequence.first;
+                if (key_index < std::max(scan.start_key, scan.cursor_key) ||
+                    key_index >= scan.end_key) {
+                    continue;
+                }
+                const uint64_t slot_idx = key_index % SLOT_NUM_PER_BUCKET;
+                uint64_t offset_units = 0;
+                if (!builder || !builder->ReadSlot(slot_idx, &offset_units).ok() ||
+                    offset_units == 0) {
+                    ++error_count;
+                    continue;
+                }
+                candidates.push_back({key_index, offset_units});
             }
-            candidates.push_back({key_index, offset_units});
         }
     }
 
@@ -2747,6 +2806,27 @@ void Memory_Node_Keeper::cold_to_hot_handler(void* arg) {
         meta.subrange_bitmap.assign(kBucketSubrangeCount, 0);
         RecomputeBucketMigrationMeta(&meta);
 
+        // The memory node can temporarily lack the compute node's complete
+        // pre-existing SST view when the shard first becomes hot. A non-zero
+        // cutover sequence with no discovered overlap cannot prove that the
+        // range is bucket-only: the freshly allocated bucket is empty at this
+        // point. Keep every subrange in migrating mode so post-cutover bucket
+        // versions are usable while older versions continue to fall back to
+        // SST. Later compaction metadata updates may refine this state.
+        const bool no_sst_overlap =
+            std::all_of(meta.subrange_overlap_counts.begin(),
+                        meta.subrange_overlap_counts.end(),
+                        [](uint32_t count) { return count == 0; });
+        if (cutover_sequence > 0 && no_sst_overlap) {
+            std::fill(meta.subrange_overlap_counts.begin(),
+                      meta.subrange_overlap_counts.end(), 1);
+            RefreshBucketBitmap(&meta);
+            std::fprintf(stdout,
+                         "cold_to_hot(meta): incomplete initial SST view; "
+                         "keeping shard=%llu in migrating mode\n",
+                         static_cast<unsigned long long>(shard_idx));
+        }
+
         for (uint8_t bit : meta.subrange_bitmap) {
             if (bit != 0) {
                 ++migrating_subranges;
@@ -2809,12 +2889,10 @@ Status Memory_Node_Keeper::hot_to_cold_worker(uint64_t shard_idx, uint64_t bucke
         };
         std::vector<SlotSnapshot> slot_snapshot;
         {
-            std::shared_lock<std::shared_mutex> update_lock(bucket_update_mu_);
-            for (const auto& key_sequence : latest_bucket_sequence_by_key_) {
+            std::shared_lock<std::shared_mutex> update_lock(
+                bucket_update_mu_by_shard_[bucket_idx]);
+            for (const auto& key_sequence : latest_bucket_sequence_by_shard_[bucket_idx]) {
                 const uint64_t key_index = key_sequence.first;
-                if (key_index / SLOT_NUM_PER_BUCKET != bucket_idx) {
-                    continue;
-                }
                 const uint64_t slot_idx = key_index % SLOT_NUM_PER_BUCKET;
                 uint64_t offset_units = 0;
                 Status read_status = builder->ReadSlot(slot_idx, &offset_units);
@@ -2907,7 +2985,9 @@ Status Memory_Node_Keeper::hot_to_cold_worker(uint64_t shard_idx, uint64_t bucke
 
     size_t cleared_slots = 0;
     if (builder) {
-        std::unique_lock<std::shared_mutex> update_lock(bucket_update_mu_);
+        std::unique_lock<std::shared_mutex> update_lock(
+            bucket_update_mu_by_shard_[bucket_idx]);
+        auto& latest_sequences = latest_bucket_sequence_by_shard_[bucket_idx];
         for (const KVItem& kv : kv_items) {
             const uint64_t slot_idx = kv.key_index % SLOT_NUM_PER_BUCKET;
             uint64_t current_offset_units = 0;
@@ -2917,10 +2997,10 @@ Status Memory_Node_Keeper::hot_to_cold_worker(uint64_t shard_idx, uint64_t bucke
             }
             Status clear_status = builder->UpdateSlot(slot_idx, 0);
             if (clear_status.ok()) {
-                auto sequence_it = latest_bucket_sequence_by_key_.find(kv.key_index);
-                if (sequence_it != latest_bucket_sequence_by_key_.end() &&
+                auto sequence_it = latest_sequences.find(kv.key_index);
+                if (sequence_it != latest_sequences.end() &&
                     sequence_it->second == kv.sequence) {
-                    latest_bucket_sequence_by_key_.erase(sequence_it);
+                    latest_sequences.erase(sequence_it);
                 }
                 ++cleared_slots;
             }
@@ -3222,8 +3302,17 @@ void Memory_Node_Keeper::sync_option_handler(RDMA_Request* request, std::string&
     opts->env = nullptr;
     opts->filter_policy = new InternalFilterPolicy(NewBloomFilterPolicy(opts->bloom_bits));
     opts->comparator = &internal_comparator_;
+    // The compute node sends its generic Options object here.  Its default
+    // max_background_compactions/MaxSubcompaction values are 12, but the
+    // memory-node CPU sweep supplies an explicit per-run worker count.  Keep
+    // that deployment setting instead of silently reverting every run to 12.
+    if (configured_compaction_threads_ > 0) {
+        opts->max_background_compactions = configured_compaction_threads_;
+        opts->MaxSubcompaction = configured_compaction_threads_;
+    }
     Compactor_pool_.SetBackgroundThreads(opts->max_background_compactions);
-    printf("Option sync finished\n");
+    printf("Option sync finished: compaction_threads=%d max_subcompactions=%d\n",
+           opts->max_background_compactions, opts->MaxSubcompaction);
     delete request;
 }
 void Memory_Node_Keeper::version_unpin_handler(RDMA_Request* request, std::string& client_ip) {

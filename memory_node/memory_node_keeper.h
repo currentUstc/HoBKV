@@ -5,6 +5,7 @@
 #ifndef TimberSaw_HOME_NODE_KEEPER_H
 #define TimberSaw_HOME_NODE_KEEPER_H
 
+#include <array>
 #include <queue>
 #include <shared_mutex>
 #include <unordered_map>
@@ -148,6 +149,9 @@ private:
     std::mutex mtx_temp;
     std::condition_variable cv_temp;
     std::shared_ptr<Options> opts;
+    // Server-side worker limits are deployment settings.  They must survive
+    // the compute node's later Options sync, whose default is 12 workers.
+    int configured_compaction_threads_ = 0;
     const InternalKeyComparator internal_comparator_;
     //  const InternalFilterPolicy internal_filter_policy_;
 
@@ -223,15 +227,16 @@ private:
                                        uint8_t target_node_id);
 
     std::mutex bucket_table_mu_;
-    // Bucket slots and the latest-version index are published together.
-    // Scans take a short shared snapshot; flush/migration publishes with an
-    // exclusive lock. Value-zone records are immutable after publication.
-    std::shared_mutex bucket_update_mu_;
+    // Bucket slots and the latest-version index are published together. Each
+    // hot region has an independent lock/index so concurrent flush helpers do
+    // not serialize unrelated regions behind one global mutex.
+    std::array<std::shared_mutex, BUCKET_NUMBER> bucket_update_mu_by_shard_;
     std::mutex value_zone_mr_mu_;
     std::vector<ibv_mr*> value_zone_mrs_;
     std::unordered_map<uint64_t, std::shared_ptr<BucketTableBuilderMemorySide>> bucket_table_builders_;
     std::unordered_map<uint64_t, ibv_mr> bucket_table_mrs_;
-    std::unordered_map<uint64_t, SequenceNumber> latest_bucket_sequence_by_key_;
+    std::array<std::unordered_map<uint64_t, SequenceNumber>, BUCKET_NUMBER>
+        latest_bucket_sequence_by_shard_;
 
     std::mutex cold_to_hot_meta_mu_;
     std::vector<std::shared_ptr<RemoteMemTableMetaData>> cold_to_hot_pending_ssts_;

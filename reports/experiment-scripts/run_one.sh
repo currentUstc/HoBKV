@@ -19,8 +19,8 @@ if (( server_cores < 2 || server_cores > 16 || server_cores % 2 != 0 )); then
   exit 2
 fi
 
-node4=REDACTED
-node6=REDACTED
+node4=${NODE4:?Set NODE4 to the memory-node address}
+node6=${NODE6:?Set NODE6 to the compute-node address}
 ssh4=(ssh -o BatchMode=yes -o ConnectTimeout=10 "$node4")
 ssh6=(ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no \
       -o UserKnownHostsFile=/tmp/codex-dlsm-known-hosts "$node6")

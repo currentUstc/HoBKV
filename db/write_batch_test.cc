@@ -12,6 +12,10 @@
 
 #include "gtest/gtest.h"
 
+#include <cstdio>
+#include <thread>
+#include <vector>
+
 namespace TimberSaw {
 
 static std::string PrintContents(WriteBatch* b) {
@@ -129,6 +133,35 @@ TEST(WriteBatchTest, ApproximateSize) {
     batch.Delete(Slice("box"));
     size_t post_delete_size = batch.ApproximateSize();
     ASSERT_LT(two_keys_size, post_delete_size);
+}
+
+TEST(WriteBatchTest, ConcurrentMemTableInsert) {
+    constexpr int kThreads = 8;
+    constexpr int kEntriesPerThread = 10000;
+    InternalKeyComparator cmp(BytewiseComparator());
+    MemTable* mem = new MemTable(cmp, kThreads * kEntriesPerThread);
+    mem->Ref();
+
+    std::vector<std::thread> writers;
+    for (int thread_id = 0; thread_id < kThreads; ++thread_id) {
+        writers.emplace_back([=] {
+            for (int i = 0; i < kEntriesPerThread; ++i) {
+                char key[32];
+                std::snprintf(key, sizeof(key), "%02d-%08d", thread_id, i);
+                const SequenceNumber sequence =
+                    static_cast<SequenceNumber>(thread_id * kEntriesPerThread + i + 1);
+                mem->Add(sequence, kTypeValue, Slice(key), Slice("value"));
+            }
+        });
+    }
+    for (auto& writer : writers) writer.join();
+
+    size_t count = 0;
+    std::unique_ptr<Iterator> iter(mem->NewIterator());
+    for (iter->SeekToFirst(); iter->Valid(); iter->Next()) ++count;
+    ASSERT_EQ(static_cast<size_t>(kThreads * kEntriesPerThread), count);
+    mem->NotFullTableflush();
+    mem->Unref();
 }
 
 }  // namespace TimberSaw

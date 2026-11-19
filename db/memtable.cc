@@ -103,7 +103,10 @@ Iterator* MemTable::NewIterator() {
 }
 
 void MemTable::Add(SequenceNumber s, ValueType type, const Slice& key, const Slice& value) {
-    std::lock_guard<std::mutex> write_lock(table_write_mutex_);
+    // InlineSkipList::InsertConcurrently and its ConcurrentArena are designed
+    // for parallel writers.  Serializing the entire encoding, allocation, and
+    // insertion path here made small-value workloads foreground-lock-bound and
+    // hid the background-work reduction from hot/cold flush separation.
     // Format of an entry is concatenation of:
     //  key_size     : varint32 of internal_key.size()
     //  key bytes    : char[internal_key.size()]

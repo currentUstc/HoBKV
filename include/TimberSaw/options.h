@@ -26,8 +26,8 @@ class Snapshot;
 
 #define INDEX_BLOCK_BIG (7 * 1024 * 1024ULL)
 #define INDEX_BLOCK_SMALL (384 * 1024ULL)
-#define FILTER_BLOCK (256 * 1024ULL)
-#define FILTER_BLOCK_COMPRESSION (3 * 1024 * 1024ULL)
+#define FILTER_BLOCK (4 * 1024 * 1024ULL)
+#define FILTER_BLOCK_COMPRESSION (4 * 1024 * 1024ULL)
 
 // bucket table parameters
 #define BUCKET_SIZE (512 * 1024 * 1024ULL)

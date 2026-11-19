@@ -824,6 +824,10 @@ Status FlushJob::BuildTable(const std::string& dbname, Env* env, const Options& 
     std::unique_ptr<TableBuilder> builder;
     std::string largest_cold_key;
     bool has_hot_entries = false;
+    uint64_t hot_entry_count = 0;
+    uint64_t hot_value_bytes = 0;
+    uint64_t cold_entry_count = 0;
+    uint64_t cold_value_bytes = 0;
     std::shared_ptr<ValueZone> hot_value_zone;
     std::shared_ptr<RDMA_Manager> hot_rdma_mg;
     uint8_t hot_target_node_id = 0;
@@ -833,6 +837,7 @@ Status FlushJob::BuildTable(const std::string& dbname, Env* env, const Options& 
         hot_target_node_id = db_impl_->GetShardTargetNodeId();
     }
     const bool collect_hot_kv = (db_impl_ != nullptr && hot_value_zone != nullptr && hot_rdma_mg != nullptr);
+    const uint64_t hot_region_mask = collect_hot_kv ? db_impl_->GetHotRegionMask() : 0;
     BucketTableBuilder hot_builder(collect_hot_kv ? hot_value_zone : nullptr,
                                    collect_hot_kv ? hot_rdma_mg : nullptr,
                                    hot_target_node_id);
@@ -867,12 +872,17 @@ Status FlushJob::BuildTable(const std::string& dbname, Env* env, const Options& 
 #ifndef NDEBUG
                 Not_drop_counter++;
 #endif
-                const bool is_hot = collect_hot_kv && db_impl_->IsHotKey(ikey.user_key);
+                const bool is_hot =
+                    collect_hot_kv && db_impl_->IsHotKey(ikey.user_key, hot_region_mask);
                 if (is_hot) {
                     hot_builder.Add(ikey.user_key, iter->value(), ikey.sequence,
                                     ikey.type == kTypeDeletion);
                     has_hot_entries = true;
+                    ++hot_entry_count;
+                    hot_value_bytes += iter->value().size();
                 } else {
+                    ++cold_entry_count;
+                    cold_value_bytes += iter->value().size();
                     if (builder == nullptr) {
                         if (table_type == block_based) {
                             builder.reset(new TableBuilder_ComputeSide(options, type, target_node_id));
@@ -907,6 +917,11 @@ Status FlushJob::BuildTable(const std::string& dbname, Env* env, const Options& 
             if (!hot_status.ok()) {
                 s = hot_status;
             }
+        }
+        if (db_impl_ != nullptr) {
+            db_impl_->RecordFlushRouting(hot_entry_count, hot_value_bytes,
+                                         cold_entry_count, cold_value_bytes,
+                                         has_hot_entries && !s.ok());
         }
 
         meta->file_size = 0;

@@ -371,6 +371,18 @@ DBImpl::~DBImpl() {
     // Wait for background work to finish.
     //  undefine_mutex.Lock();
     printf("DBImpl deallocated\n");
+    printf("Bucket read stats: attempts=%llu hits=%llu misses=%llu sst_fallbacks=%llu\n",
+           static_cast<unsigned long long>(bucket_get_attempts_.load(std::memory_order_relaxed)),
+           static_cast<unsigned long long>(bucket_get_hits_.load(std::memory_order_relaxed)),
+           static_cast<unsigned long long>(bucket_get_misses_.load(std::memory_order_relaxed)),
+           static_cast<unsigned long long>(bucket_sst_fallbacks_.load(std::memory_order_relaxed)));
+    printf("Flush routing stats: hot_entries=%llu hot_bytes=%llu cold_entries=%llu cold_bytes=%llu "
+           "bucket_failures=%llu\n",
+           static_cast<unsigned long long>(bucket_flush_hot_entries_.load(std::memory_order_relaxed)),
+           static_cast<unsigned long long>(bucket_flush_hot_bytes_.load(std::memory_order_relaxed)),
+           static_cast<unsigned long long>(bucket_flush_cold_entries_.load(std::memory_order_relaxed)),
+           static_cast<unsigned long long>(bucket_flush_cold_bytes_.load(std::memory_order_relaxed)),
+           static_cast<unsigned long long>(bucket_flush_failures_.load(std::memory_order_relaxed)));
     printf("Cache entried used is %f\n", table_cache_->CheckUtilizaitonOfCache());
     WaitforAllbgtasks(false);
     // TODO: recycle all the
@@ -1909,6 +1921,7 @@ void DBImpl::BackgroundCompaction(void* p) {
                 DEBUG_arg("Trival compaction< level 0 file number is %d\n", c->num_input_files(0));
                 //      } else if (options_.near_data_compaction && need_push_down) {
             } else if (need_push_down) {
+                LogCompactionInputRanges(c);
                 // try to let the CPU print the average CPU utilizaiton when compaciotn is triggered.
                 //       if (!compaction_start){
                 //          env_->rdma_mg->Print_Remote_CPU_RPC(0);
@@ -3675,13 +3688,32 @@ void DBImpl::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
     delete input;
     //  input = nullptr;
 }
+void DBImpl::LogCompactionInputRanges(Compaction* compaction) {
+    static std::atomic<uint64_t> compaction_log_id{0};
+    const uint64_t compaction_id = compaction_log_id.fetch_add(1, std::memory_order_relaxed) + 1;
+    const uint64_t ts_us = env_->NowMicros();
+    for (int which = 0; which < 2; ++which) {
+        for (int i = 0; i < compaction->num_input_files(which); ++i) {
+            const auto& file = compaction->input(which, i);
+            const std::string smallest = file->smallest.user_key().ToString();
+            const std::string largest = file->largest.user_key().ToString();
+            std::fprintf(stdout,
+                         "COMPACTION_INPUT system=dLSM compaction_id=%llu ts_us=%llu input_level=%d "
+                         "file=%llu smallest=%s largest=%s\n",
+                         static_cast<unsigned long long>(compaction_id),
+                         static_cast<unsigned long long>(ts_us), file->level,
+                         static_cast<unsigned long long>(file->number), smallest.c_str(), largest.c_str());
+        }
+    }
+    std::fflush(stdout);
+}
+
 Status DBImpl::DoCompactionWork(CompactionState* compact) {
     const uint64_t start_micros = env_->NowMicros();
     int64_t imm_micros = 0;  // Micros spent doing imm_ compactions
 
     Log(options_.info_log, "Compacting %d@%d + %d@%d files", compact->compaction->num_input_files(0),
         compact->compaction->level(), compact->compaction->num_input_files(1), compact->compaction->level() + 1);
-
     assert(versions_->NumLevelFiles(compact->compaction->level()) > 0);
     assert(compact->builder == nullptr);
     //  assert(compact->outfile == nullptr);
@@ -4079,27 +4111,11 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key, std::string* va
     Version::GetStats stats;
 
     bool read_sst = true;
-    bool bucket_checked = false;
     SequenceNumber cutover_sequence = 0;
     size_t shard_idx = 0;
-    if (GetShardIndexForKey(key, &shard_idx)) {
+    const bool valid_shard = options_.enable_hot_cold && GetShardIndexForKey(key, &shard_idx);
+    if (valid_shard) {
         read_sst = ShouldReadSSTForKey(key, shard_idx, &cutover_sequence);
-    }
-
-    // Once a subrange is bucket-only, the bucket is its primary read path.
-    // Keep falling back to the memtable below when the bucket misses, because
-    // a concurrent write publishes to the memtable before its bucket update
-    // has completed.
-    if (options.snapshot == nullptr && !read_sst) {
-        bucket_checked = true;
-        Status bucket_status;
-        SequenceNumber bucket_seq = 0;
-        bool bucket_deletion = false;
-        if (TryGetValueFromBucket(shard_idx, key, value, &bucket_seq, &bucket_deletion, &bucket_status) &&
-            bucket_seq <= snapshot) {
-            ReturnAndCleanupSuperVersion(sv);
-            return bucket_deletion ? Status::NotFound("deleted in hot bucket") : Status::OK();
-        }
     }
 
     // Unlock while reading from files and memtables
@@ -4112,28 +4128,35 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key, std::string* va
             // Done
         } else if (imm != nullptr && imm->Get(lkey, value, &s)) {
             // Done
-        } else if (bucket_checked) {
-            // The bucket-only fast path above already checked the bucket.
-            // Do not issue the same synchronous bucket-table/value-zone RDMA
-            // sequence again on a miss; existing cold data remains in SST.
-            s = current->Get(options, lkey, value, &stats);
         } else {
             Status bucket_status;
             SequenceNumber bucket_seq = 0;
             bool bucket_deletion = false;
-            if (TryGetValueFromBucket(shard_idx, key, value, &bucket_seq, &bucket_deletion, &bucket_status)) {
+            bool bucket_found = false;
+            if (valid_shard && bucket_table_handler_ != nullptr && value_zone_ != nullptr) {
+                bucket_get_attempts_.fetch_add(1, std::memory_order_relaxed);
+                bucket_found =
+                    TryGetValueFromBucket(shard_idx, key, value, &bucket_seq, &bucket_deletion, &bucket_status);
+                if (!bucket_found) {
+                    bucket_get_misses_.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            if (bucket_found) {
                 // bucket-only: 不读 SST；migrating: 若 bucket 版本已跨过 cutover，也不读 SST。
                 if (bucket_seq <= snapshot && (!read_sst || bucket_seq > cutover_sequence)) {
+                    bucket_get_hits_.fetch_add(1, std::memory_order_relaxed);
                     s = bucket_deletion ? Status::NotFound("deleted in hot bucket") : Status::OK();
                 } else {
+                    bucket_sst_fallbacks_.fetch_add(1, std::memory_order_relaxed);
                     s = current->Get(options, lkey, value, &stats);
                 }
-            } else if (!read_sst) {
-                // Existing cold data can still reside only in SST when a
-                // region first becomes hot. A bucket miss must therefore
-                // fall back to SST; bucket hits remain the primary path.
-                s = current->Get(options, lkey, value, &stats);
             } else {
+                if (valid_shard && bucket_table_handler_ != nullptr && value_zone_ != nullptr) {
+                    bucket_sst_fallbacks_.fetch_add(1, std::memory_order_relaxed);
+                }
+                // Remain conservative on a bucket miss. This also covers a
+                // write that is between memtable publication and bucket-slot
+                // publication, and protects against stale migration metadata.
                 s = current->Get(options, lkey, value, &stats);
             }
             // have_stat_update = true;
@@ -4345,34 +4368,100 @@ bool DBImpl::GetShardIndexForKey(const Slice& key, size_t* shard_idx) const {
 }
 
 void DBImpl::RecordKeyAccess(const Slice& key, bool is_write) {
-    if (key_range_hot_stats_.empty() || max_key_range_ == 0) {
+    if (!ShouldSampleHotness()) {
         return;
+    }
+    RecordSampledKeyAccess(key, is_write);
+}
+
+bool DBImpl::ShouldSampleHotness() {
+    if (!options_.enable_hot_cold || key_range_hot_stats_.empty() || max_key_range_ == 0) {
+        return false;
     }
 
     if (shard_config_.KV_shards == 0) {
-        return;
+        return false;
     }
-    
+
+    constexpr uint64_t kHotnessSampleRate = 64;
+    thread_local const DBImpl* sample_owner = nullptr;
+    thread_local uint64_t hotness_sample_counter = 0;
+    if (sample_owner != this) {
+        sample_owner = this;
+        hotness_sample_counter = 0;
+    }
+    if ((hotness_sample_counter++ & (kHotnessSampleRate - 1)) != 0) {
+        return false;
+    }
+
+    return true;
+}
+
+void DBImpl::RecordSampledKeyAccess(const Slice& key, bool is_write) {
+    constexpr uint64_t kHotnessSampleRate = 64;
+    constexpr uint64_t kMergeCheckSamples = 256;
+
     size_t shard_idx = 0;
     if (!GetShardIndexForKey(key, &shard_idx)) {
         return;
     }
-    
-    KeyRangeHotStats& stats = key_range_hot_stats_[shard_idx];
-    stats.access_count.fetch_add(1, std::memory_order_relaxed);
-    
-    if (is_write) {
-        stats.write_count.fetch_add(1, std::memory_order_relaxed);
-    } else {
-        stats.read_count.fetch_add(1, std::memory_order_relaxed);
+
+    struct ThreadHotnessCounters {
+        const DBImpl* owner = nullptr;
+        std::array<uint64_t, BUCKET_NUMBER> reads{};
+        std::array<uint64_t, BUCKET_NUMBER> writes{};
+        uint64_t last_merge_us = 0;
+        uint64_t samples_since_time_check = 0;
+    };
+    thread_local ThreadHotnessCounters local;
+    if (local.owner != this) {
+        local = ThreadHotnessCounters{};
+        local.owner = this;
+        local.last_merge_us = env_->NowMicros();
     }
-    
+
+    if (is_write) {
+        local.writes[shard_idx] += kHotnessSampleRate;
+    } else {
+        local.reads[shard_idx] += kHotnessSampleRate;
+    }
+
+    if (++local.samples_since_time_check < kMergeCheckSamples) {
+        return;
+    }
+    local.samples_since_time_check = 0;
+    const uint64_t now = env_->NowMicros();
+    if (now - local.last_merge_us < hotness_config_.check_interval_us) {
+        return;
+    }
+
+    for (size_t i = 0; i < shard_config_.KV_shards; ++i) {
+        const uint64_t reads = local.reads[i];
+        const uint64_t writes = local.writes[i];
+        if (reads != 0) {
+            key_range_hot_stats_[i].read_count.fetch_add(reads, std::memory_order_relaxed);
+            local.reads[i] = 0;
+        }
+        if (writes != 0) {
+            key_range_hot_stats_[i].write_count.fetch_add(writes, std::memory_order_relaxed);
+            local.writes[i] = 0;
+        }
+        if (reads != 0 || writes != 0) {
+            key_range_hot_stats_[i].access_count.fetch_add(reads + writes,
+                                                           std::memory_order_relaxed);
+        }
+    }
+    local.last_merge_us = now;
     MaybeScheduleHotnessAdjustment();
 }
 
 // 查询 user_key 所在分区是否为热区
 bool DBImpl::IsHotKey(const Slice& user_key) {
-    if (key_range_hot_stats_.empty() || max_key_range_ == 0) {
+    return IsHotKey(user_key, GetHotRegionMask());
+}
+
+bool DBImpl::IsHotKey(const Slice& user_key, uint64_t hot_region_mask) const {
+    if (!options_.enable_hot_cold || key_range_hot_stats_.empty() || max_key_range_ == 0) {
         return false;
     }
 
@@ -4381,12 +4470,23 @@ bool DBImpl::IsHotKey(const Slice& user_key) {
         return false;
     }
 
-    std::lock_guard<std::mutex> lock(hot_stats_mutex_);
-    return hot_region_set_.find(shard_idx) != hot_region_set_.end();
+    return shard_idx < 64 && (hot_region_mask & (uint64_t{1} << shard_idx)) != 0;
 }
 
 void DBImpl::RecordWriteAccess(const Slice& user_key) {
-    RecordKeyAccess(user_key, true);
+    RecordSampledKeyAccess(user_key, true);
+}
+
+void DBImpl::RecordFlushRouting(uint64_t hot_entries, uint64_t hot_bytes,
+                                uint64_t cold_entries, uint64_t cold_bytes,
+                                bool bucket_flush_failed) {
+    bucket_flush_hot_entries_.fetch_add(hot_entries, std::memory_order_relaxed);
+    bucket_flush_hot_bytes_.fetch_add(hot_bytes, std::memory_order_relaxed);
+    bucket_flush_cold_entries_.fetch_add(cold_entries, std::memory_order_relaxed);
+    bucket_flush_cold_bytes_.fetch_add(cold_bytes, std::memory_order_relaxed);
+    if (bucket_flush_failed) {
+        bucket_flush_failures_.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 // 基于指数衰减的滑动窗口，计算并更新所有 shard 的热度评分
@@ -4526,6 +4626,14 @@ void DBImpl::AdjustHotColdRegions() {
             hot_region_lru_.push_front(shard_idx);
         }
     }
+
+    uint64_t new_hot_region_mask = 0;
+    for (size_t shard_idx : hot_region_set_) {
+        if (shard_idx < 64) {
+            new_hot_region_mask |= uint64_t{1} << shard_idx;
+        }
+    }
+    hot_region_mask_.store(new_hot_region_mask, std::memory_order_release);
 }
 
 void DBImpl::GetShardKeyRange(size_t shard_idx, uint64_t* min_key, uint64_t* max_key) const {
@@ -4572,20 +4680,21 @@ Status DBImpl::EnsureBucketAllocatedForShard(size_t shard_idx) {
 
 // 按间隔调度热度调整任务，避免频繁执行
 void DBImpl::MaybeScheduleHotnessAdjustment() {
-    uint64_t now = env_->NowMicros();
-    
-    // 检查是否需要调度（距离上次检查超过指定间隔）
-    if (now - last_hotness_check_time_ < hotness_config_.check_interval_us) {
+    const uint64_t now = env_->NowMicros();
+    uint64_t last = last_hotness_check_time_.load(std::memory_order_relaxed);
+    if (now - last < hotness_config_.check_interval_us) {
         return;
     }
-    
+    if (!last_hotness_check_time_.compare_exchange_strong(
+            last, now, std::memory_order_relaxed, std::memory_order_relaxed)) {
+        return;
+    }
+
     bool expected = false;
     if (!hotness_adjustment_scheduled_.compare_exchange_strong(expected, true)) {
         return;  // 已经有调度任务在运行
     }
-    
-    last_hotness_check_time_ = now;
-    
+
     std::thread hotness_thread(&DBImpl::BGWork_HotnessAdjustment, this);
     hotness_thread.detach();  // 让线程在后台独立运行
 }
@@ -4914,7 +5023,7 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
         printf("Weird status not OK");
         assert(0 == 1);
     }
-    if (status.ok() && updates != nullptr && options.track_hotness) {
+    if (status.ok() && updates != nullptr && options.track_hotness && ShouldSampleHotness()) {
         WriteAccessRecorder recorder(this);
         status = updates->Iterate(&recorder);
     }

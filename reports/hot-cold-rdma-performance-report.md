@@ -12,8 +12,8 @@
 
 - 开发版本：`codex/hot-cold-rdma-fixes@5fd2f0f` 加当前工作区修复。
 - baseline：相同代码与参数，仅将热迁移阈值设为 `UINT64_MAX`，数据只进入 SST。
-- node4：内存节点，`REDACTED`，RDMA 设备 `mlx5_1` 位于 NUMA 1。
-- node6：计算节点，`REDACTED`。
+- node4：内存节点，RDMA 设备 `mlx5_1` 位于 NUMA 1。
+- node6：计算节点。
 - node4 Server 固定到 NUMA 1 的 8 个物理核心：`1,3,5,7,9,11,13,15`，不使用 SMT sibling。
 - node6 前台线程：16。
 - 后台 flush 线程：4。
